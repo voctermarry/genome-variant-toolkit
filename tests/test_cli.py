@@ -141,3 +141,122 @@ def test_unknown_argument_exit_2_single_line() -> None:
     assert code == 2
     assert out == ""
     assert err.count("\n") == 1
+
+
+def test_filter_reads_trims_and_filters_stdin() -> None:
+    fastq = (
+        "@keep desc\n" + "A" * 30 + "\n+keep desc\n" + "I" * 30 + "\n"
+        "@trim\n" + "TT" + "A" * 30 + "TT\n+\n" + "!!" + "I" * 30 + "!!\n"
+        "@low\n" + "A" * 30 + "\n+\n" + "!" * 30 + "\n"
+    )
+    code, out, err = run(["filter-reads", "-"], fastq)
+    assert code == 0
+    assert err == ""
+    assert out == (
+        "@keep desc\n" + "A" * 30 + "\n+keep desc\n" + "I" * 30 + "\n"
+        "@trim\n" + "A" * 30 + "\n+trim\n" + "I" * 30 + "\n"
+    )
+
+
+def test_filter_reads_threshold_options() -> None:
+    fastq = "@r\n" + "A" * 10 + "\n+\n" + "5" * 10 + "\n"  # Phred 20
+    code, out, err = run(
+        ["filter-reads", "-", "--min-length", "5", "--min-end-quality", "21"],
+        fastq,
+    )
+    assert code == 0
+    assert out == ""
+    assert err == ""
+
+    code, out, err = run(
+        ["filter-reads", "-", "--min-length", "5", "--min-mean-quality", "21"],
+        fastq,
+    )
+    assert code == 0
+    assert out == ""
+
+
+def test_filter_reads_all_filtered_output_empty() -> None:
+    code, out, err = run(
+        ["filter-reads", "-", "--min-length", "100"],
+        "@r\n" + "A" * 10 + "\n+\n" + "I" * 10 + "\n",
+    )
+    assert code == 0
+    assert out == ""
+    assert err == ""
+
+
+def test_filter_reads_rejects_fasta_input() -> None:
+    code, out, err = run(["filter-reads", "-"], ">a\nACGT\n")
+    assert code == 2
+    assert out == ""
+    assert err.count("\n") == 1
+
+
+def test_filter_reads_format_and_base_errors_exit_2() -> None:
+    code, out, err = run(["filter-reads", "-"], "@a\nACGZ\n+\nIIII\n")
+    assert code == 2
+    assert err.count("\n") == 1
+
+    code, out, err = run(["filter-reads", "-"], "@a\nACGT\n+\nIII\n")
+    assert code == 2
+    assert err.count("\n") == 1
+
+
+def test_filter_reads_invalid_thresholds_exit_2() -> None:
+    fastq = "@r\n" + "A" * 30 + "\n+\n" + "I" * 30 + "\n"
+    for args in (
+        ["--min-end-quality", "94"],
+        ["--min-end-quality", "-1"],
+        ["--min-mean-quality", "94"],
+        ["--min-length", "0"],
+        ["--min-length", "abc"],
+    ):
+        code, out, err = run(["filter-reads", "-", *args], fastq)
+        assert code == 2, args
+        assert out == ""
+        assert err.count("\n") == 1
+
+
+def test_filter_reads_input_file_error_exit_1(tmp_path) -> None:
+    code, out, err = run(["filter-reads", str(tmp_path / "missing.fq")])
+    assert code == 1
+    assert out == ""
+    assert err.count("\n") == 1
+
+
+def test_filter_reads_output_file_byte_stable(tmp_path) -> None:
+    source = tmp_path / "in.fq"
+    source.write_text("@x some read\n" + "a" * 30 + "\n+x some read\n" + "I" * 30 + "\n")
+    first = tmp_path / "out1.fq"
+    second = tmp_path / "out2.fq"
+    code1, _, err1 = run(["filter-reads", str(source), "--output", str(first)])
+    code2, _, err2 = run(["filter-reads", str(source), "--output", str(second)])
+    assert code1 == code2 == 0
+    assert err1 == err2 == ""
+    expected = b"@x some read\n" + b"A" * 30 + b"\n+x some read\n" + b"I" * 30 + b"\n"
+    assert first.read_bytes() == second.read_bytes() == expected
+
+
+def test_filter_reads_output_error_leaves_existing_file(tmp_path) -> None:
+    target = tmp_path / "out.fq"
+    target.write_bytes(b"previous content\n")
+    # ReadQualityError surfaces mid-iteration: quality length mismatch is a
+    # format error at read time; use a FASTA input to force a read error.
+    source = tmp_path / "in.fq"
+    source.write_text(">a\nACGT\n")
+    code, _, err = run(["filter-reads", str(source), "--output", str(target)])
+    assert code == 2
+    assert err.count("\n") == 1
+    assert target.read_bytes() == b"previous content\n"
+    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".filter-reads-")]
+    assert leftovers == []
+
+
+def test_filter_reads_output_write_error_exit_1_no_partial(tmp_path) -> None:
+    code, _, err = run(
+        ["filter-reads", "-", "--output", str(tmp_path / "no-dir" / "out.fq")],
+        "@r\n" + "A" * 30 + "\n+\n" + "I" * 30 + "\n",
+    )
+    assert code == 1
+    assert err.count("\n") == 1
