@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genome-variant-toolkit"
+version = "0.1.0"
+description = "Genomic variant analysis toolkit from reads to annotated calls"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+genome-variant-toolkit = "genome_variant.cli:main"
+
+[tool.setuptools]
+packages = ["genome_variant"]

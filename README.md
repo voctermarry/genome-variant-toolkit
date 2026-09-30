@@ -6,36 +6,33 @@
 
 ## 环境与安装
 
-- C++20 编译器（GCC 13 及以上）
-- CMake 3.22 及以上
+- Python 3.11 及以上
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+python -m pip install -e .
 ```
 
 ## 测试
 
 ```bash
-ctest --test-dir build --output-on-failure
+python -m pytest
 ```
 
-基线只有骨架自检用例，后续新增用例同样通过 CTest 执行。
+基线尚无测试用例，收集到 0 个用例属预期结果。
 
 ## 命令行入口
 
-构建后提供 `genome-variant-toolkit` 可执行文件：
+安装后提供 `genome-variant-toolkit` 命令：
 
 ```bash
-./build/genome-variant-toolkit version    # 打印版本号
-./build/genome-variant-toolkit --help     # 打印用法
+genome-variant-toolkit version    # 打印版本号
+genome-variant-toolkit --help     # 打印用法
 ```
 
 ## 现有公开接口
 
-- 可执行程序 `genome-variant-toolkit`，支持子命令 `version` 与 `help`
-- C++ 静态库目标 `genome_variant_core`，公开头文件 `<genome_variant/version.hpp>`
-- `genome_variant::version()` 返回当前版本号，`genome_variant::kVersion` 为同值常量
+- 命令行程序 `genome-variant-toolkit`
+- Python 包 `genome_variant`，其 `__version__` 为当前版本号
 
 ## 限制
 
