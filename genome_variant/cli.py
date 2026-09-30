@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 
 from . import __version__
+from .quality import ReadQualityError, filter_reads
 from .sequence_io import (
     SequenceFormatError,
     SequenceRecord,
     SequenceValidationError,
     read_sequences,
     write_sequences,
+)
+
+# Read/parse/processing errors that make the invocation invalid usage.
+# ReadQualityError is a ValueError subclass but is listed explicitly.
+_READ_ERRORS = (
+    SequenceFormatError,
+    SequenceValidationError,
+    ReadQualityError,
+    ValueError,
 )
 
 
@@ -23,6 +35,20 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value!r} is not a positive integer")
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"{value!r} is not a positive integer")
+    return parsed
+
+
+def _quality_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not an integer in the range 0-93"
+        )
+    if not 0 <= parsed <= 93:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not an integer in the range 0-93"
+        )
     return parsed
 
 
@@ -76,6 +102,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="maximum FASTA sequence line width in characters (default: 60); "
         "FASTQ layout is always four lines per record",
     )
+
+    filter_reads_cmd = sub.add_parser(
+        "filter-reads",
+        help="trim low-quality ends and filter FASTQ reads",
+    )
+    filter_reads_cmd.add_argument("input", help="FASTQ input file, or '-' for standard input")
+    filter_reads_cmd.add_argument(
+        "--min-end-quality",
+        type=_quality_int,
+        default=20,
+        metavar="N",
+        help="trim bases with Phred quality strictly below N from both ends "
+        "(default: 20)",
+    )
+    filter_reads_cmd.add_argument(
+        "--min-mean-quality",
+        type=_quality_int,
+        default=20,
+        metavar="N",
+        help="drop reads whose mean Phred quality is below N after trimming "
+        "(default: 20)",
+    )
+    filter_reads_cmd.add_argument(
+        "--min-length",
+        type=_positive_int,
+        default=30,
+        metavar="N",
+        help="drop reads shorter than N bases after trimming (default: 30)",
+    )
+    filter_reads_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -93,6 +153,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "normalize-sequences":
         return _run_normalize(args, parser)
+
+    if args.command == "filter-reads":
+        return _run_filter_reads(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -170,6 +233,137 @@ def _run_normalize(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             input_stream.close()
 
     return 0
+
+
+def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.input == "-":
+        input_stream = sys.stdin
+        close_input = False
+    else:
+        try:
+            input_stream = open(args.input, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        close_input = True
+
+    try:
+        records: Iterable[SequenceRecord] = read_sequences(
+            input_stream, format="fastq"
+        )
+        filtered = filter_reads(
+            records,
+            min_end_quality=args.min_end_quality,
+            min_mean_quality=args.min_mean_quality,
+            min_length=args.min_length,
+        )
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            output_stream = sys.stdout
+            close_output = False
+            temporary_path = None
+        else:
+            output_stream, temporary_path = _open_temporary_output(
+                args.output, parser
+            )
+            if output_stream is None:
+                return 1
+            close_output = True
+
+        try:
+            try:
+                write_sequences(filtered, output_stream, format="fastq")
+            except _READ_ERRORS as exc:
+                if temporary_path is not None:
+                    _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 2
+            except OSError as exc:
+                if temporary_path is not None:
+                    _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+
+            if temporary_path is not None:
+                try:
+                    output_stream.flush()
+                    output_stream.close()
+                    os.replace(temporary_path, args.output)
+                except OSError as exc:
+                    _discard_temporary(output_stream, temporary_path)
+                    print(f"{parser.prog}: {exc}", file=sys.stderr)
+                    return 1
+        finally:
+            # On failure the temporary file was already closed and removed
+            # by _discard_temporary; on success it was closed explicitly
+            # before os.replace. This only closes a still-open temp stream.
+            if close_output and not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_input:
+            input_stream.close()
+
+    return 0
+
+
+def _discard_temporary(stream: object, path: str) -> None:
+    """Close and remove a temporary output file after a failed run."""
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except OSError:
+            pass
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _open_temporary_output(
+    destination: str, parser: argparse.ArgumentParser
+) -> tuple[object, str] | tuple[None, None]:
+    """Create a temporary text file next to *destination*.
+
+    Returns ``(stream, path)``; on failure prints one error line and
+    returns ``(None, None)``.
+    """
+    output_dir = os.path.dirname(os.path.abspath(destination))
+    try:
+        fd, path = tempfile.mkstemp(
+            dir=output_dir,
+            prefix=".filter-reads-",
+            suffix=".tmp",
+        )
+        # mkstemp creates files with mode 0600; match the mode a plain
+        # open() would give the final output instead.
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        os.fchmod(fd, 0o666 & ~current_umask)
+    except OSError as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return None, None
+    try:
+        return os.fdopen(fd, "w", encoding="utf-8", newline=""), path
+    except OSError as exc:
+        try:
+            os.close(fd)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return None, None
 
 
 if __name__ == "__main__":
