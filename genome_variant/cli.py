@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 
 from . import __version__
+from .alignment import PairwiseAlignment, align_pair
 from .kmer import build_kmer_index
 from .quality import ReadQualityError, filter_reads
 from .sequence_io import (
@@ -50,6 +51,20 @@ def _quality_int(value: str) -> int:
     if not 0 <= parsed <= 93:
         raise argparse.ArgumentTypeError(
             f"{value!r} is not an integer in the range 0-93"
+        )
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a non-negative integer"
+        )
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a non-negative integer"
         )
     return parsed
 
@@ -168,6 +183,72 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    align_pair_cmd = sub.add_parser(
+        "align-pair",
+        help="align two single-record FASTA/FASTQ inputs pairwise",
+    )
+    align_pair_cmd.add_argument(
+        "reference", help="reference input file, or '-' for standard input"
+    )
+    align_pair_cmd.add_argument(
+        "query", help="query input file, or '-' for standard input"
+    )
+    align_pair_cmd.add_argument(
+        "--reference-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="reference input format (default: auto-detect)",
+    )
+    align_pair_cmd.add_argument(
+        "--query-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="query input format (default: auto-detect)",
+    )
+    align_pair_cmd.add_argument(
+        "--mode",
+        choices=("global", "local"),
+        default="global",
+        help="alignment mode (default: global)",
+    )
+    align_pair_cmd.add_argument(
+        "--match",
+        "--match-score",
+        dest="match",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="match score, a positive integer (default: 2)",
+    )
+    align_pair_cmd.add_argument(
+        "--mismatch",
+        "--mismatch-penalty",
+        dest="mismatch",
+        type=_nonnegative_int,
+        default=3,
+        metavar="N",
+        help="mismatch penalty, a non-negative integer (default: 3)",
+    )
+    align_pair_cmd.add_argument(
+        "--gap-open",
+        type=_nonnegative_int,
+        default=5,
+        metavar="N",
+        help="gap opening penalty, a non-negative integer (default: 5)",
+    )
+    align_pair_cmd.add_argument(
+        "--gap-extend",
+        type=_nonnegative_int,
+        default=2,
+        metavar="N",
+        help="gap extension penalty, a non-negative integer (default: 2)",
+    )
+    align_pair_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -191,6 +272,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "kmer-index":
         return _run_kmer_index(args, parser)
+
+    if args.command == "align-pair":
+        return _run_align_pair(args, parser)
 
     if args.command == "kmer-index":
         return _run_kmer_index(args, parser)
@@ -441,6 +525,153 @@ def _run_kmer_index(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     finally:
         if close_input:
             input_stream.close()
+
+    return 0
+
+
+def _read_single_record(
+    path: str,
+    fmt: str,
+    parser: argparse.ArgumentParser,
+    label: str,
+) -> tuple[SequenceRecord | None, object, bool, int]:
+    """Read exactly one record from *path*.
+
+    Returns ``(record, stream, close, exit_code)``; *record* is ``None``
+    when the invocation failed and *exit_code* is then ``1`` or ``2``.
+    ``"-"`` reads from standard input.
+    """
+    if path == "-":
+        stream = sys.stdin
+        close = False
+    else:
+        try:
+            stream = open(path, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {label}: {exc}", file=sys.stderr)
+            return None, None, False, 1
+        close = True
+
+    try:
+        records = read_sequences(stream, format=fmt)
+        try:
+            first = next(records)
+        except StopIteration:
+            raise SequenceFormatError(f"{label}: empty input")
+        try:
+            next(records)
+        except StopIteration:
+            return first, stream, close, 0
+        raise SequenceFormatError(f"{label}: expected exactly one record, got more")
+    except (SequenceFormatError, SequenceValidationError, ValueError) as exc:
+        if close:
+            stream.close()
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return None, None, False, 2
+    except OSError as exc:
+        if close:
+            stream.close()
+        print(f"{parser.prog}: {label}: {exc}", file=sys.stderr)
+        return None, None, False, 1
+
+
+def _alignment_to_json(result: PairwiseAlignment) -> str:
+    return json.dumps(
+        {
+            "reference": result.reference,
+            "query": result.query,
+            "mode": result.mode,
+            "score": result.score,
+            "reference_start": result.reference_start,
+            "reference_end": result.reference_end,
+            "query_start": result.query_start,
+            "query_end": result.query_end,
+            "cigar": result.cigar,
+            "aligned_reference": result.aligned_reference,
+            "aligned_query": result.aligned_query,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _run_align_pair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.reference == "-" and args.query == "-":
+        print(
+            f"{parser.prog}: reference and query cannot both be read from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    reference_record, ref_stream, close_ref, ref_code = _read_single_record(
+        args.reference, args.reference_format, parser, "reference"
+    )
+    if reference_record is None:
+        return ref_code
+
+    query_record, query_stream, close_query, query_code = _read_single_record(
+        args.query, args.query_format, parser, "query"
+    )
+    if query_record is None:
+        if close_ref:
+            ref_stream.close()
+        return query_code
+
+    try:
+        try:
+            result = align_pair(
+                reference_record,
+                query_record,
+                mode=args.mode,
+                match_score=args.match,
+                mismatch_penalty=args.mismatch,
+                gap_open=args.gap_open,
+                gap_extend=args.gap_extend,
+            )
+        except (SequenceValidationError, ValueError) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        text = _alignment_to_json(result) + "\n"
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".align-pair-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_ref:
+            ref_stream.close()
+        if close_query:
+            query_stream.close()
 
     return 0
 
