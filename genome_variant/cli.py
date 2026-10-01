@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 
 from . import __version__
+from .kmer import build_kmer_index
 from .quality import ReadQualityError, filter_reads
 from .sequence_io import (
     SequenceFormatError,
@@ -136,6 +138,36 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    kmer_index_cmd = sub.add_parser(
+        "kmer-index",
+        help="build a k-mer index and write it as JSON Lines",
+    )
+    kmer_index_cmd.add_argument("input", help="input file, or '-' for standard input")
+    kmer_index_cmd.add_argument(
+        "--input-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="input format (default: auto-detect from the first title line)",
+    )
+    kmer_index_cmd.add_argument(
+        "--k",
+        type=_positive_int,
+        required=True,
+        metavar="N",
+        help="k-mer length (a positive integer)",
+    )
+    kmer_index_cmd.add_argument(
+        "--no-canonical",
+        action="store_true",
+        help="index k-mers on the forward strand only (default: canonicalize "
+        "each k-mer against its reverse complement)",
+    )
+    kmer_index_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -156,6 +188,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "filter-reads":
         return _run_filter_reads(args, parser)
+
+    if args.command == "kmer-index":
+        return _run_kmer_index(args, parser)
+
+    if args.command == "kmer-index":
+        return _run_kmer_index(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -313,6 +351,100 @@ def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser)
     return 0
 
 
+def _run_kmer_index(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.input == "-":
+        input_stream = sys.stdin
+        close_input = False
+    else:
+        try:
+            input_stream = open(args.input, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        close_input = True
+
+    try:
+        records: Iterable[SequenceRecord] = read_sequences(
+            input_stream, format=args.input_format
+        )
+        # Build the whole index before writing anything: all reading and
+        # validation happens here, so a failure never produces partial
+        # output or touches the output file.
+        try:
+            index = build_kmer_index(
+                records, args.k, canonical=not args.no_canonical
+            )
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        lines = []
+        for kmer, occurrences in index.items():
+            lines.append(
+                json.dumps(
+                    {
+                        "kmer": kmer,
+                        "count": len(occurrences),
+                        "occurrences": [
+                            {
+                                "record": occurrence.record,
+                                "id": occurrence.id,
+                                "position": occurrence.position,
+                                "strand": occurrence.strand,
+                            }
+                            for occurrence in occurrences
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        text = "".join(line + "\n" for line in lines)
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".kmer-index-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_input:
+            input_stream.close()
+
+    return 0
+
+
 def _discard_temporary(stream: object, path: str) -> None:
     """Close and remove a temporary output file after a failed run."""
     close = getattr(stream, "close", None)
@@ -330,7 +462,9 @@ def _discard_temporary(stream: object, path: str) -> None:
 
 
 def _open_temporary_output(
-    destination: str, parser: argparse.ArgumentParser
+    destination: str,
+    parser: argparse.ArgumentParser,
+    prefix: str = ".filter-reads-",
 ) -> tuple[object, str] | tuple[None, None]:
     """Create a temporary text file next to *destination*.
 
@@ -341,7 +475,7 @@ def _open_temporary_output(
     try:
         fd, path = tempfile.mkstemp(
             dir=output_dir,
-            prefix=".filter-reads-",
+            prefix=prefix,
             suffix=".tmp",
         )
         # mkstemp creates files with mode 0600; match the mode a plain
