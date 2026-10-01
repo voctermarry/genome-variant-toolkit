@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引，以及 global/local 成对序列比对功能。
 
 ## 环境与安装
 
@@ -83,6 +83,30 @@ genome-variant-toolkit kmer-index INPUT --k N \
 - 输出到文件时先完成全部读取与校验，再经同目录临时文件原子替换；失败不改变已有目标、不留下部分结果。
 - 返回码：成功 `0`；参数、格式或序列错误 `2`（标准错误单行消息，且不输出数据）；文件读写错误 `1`。
 
+### align-pair
+
+将两个输入中的各一条记录作为参考与查询进行成对序列比对，输出单行紧凑 JSON：
+
+```bash
+genome-variant-toolkit align-pair REFERENCE QUERY \
+    [--reference-format fasta|fastq|auto] \
+    [--query-format fasta|fastq|auto] \
+    [--mode global|local] \
+    [--match-score N] [--mismatch-penalty N] \
+    [--gap-open-penalty N] [--gap-extend-penalty N] \
+    [--output OUTPUT]
+```
+
+- 两个输入默认按现有规则自动识别格式（`>` 为 FASTA、`@` 为 FASTQ），各自必须恰好包含一条记录；FASTQ 质量值不参与打分。
+- `--mode` 选择 `global`（默认，覆盖两条完整序列）或 `local`（只返回正分最佳片段；无正分片段时分数为 0、四个坐标均为 0、对齐串与 CIGAR 为空）。
+- 分值均为整数：匹配分为正整数（默认 2），错配、缺口开启、缺口延伸罚分为非负整数（默认 2、2、1，从分数中扣除）；长度为 L 的连续缺口扣 `gap_open + gap_extend × (L-1)`。仅完全相同的字符算匹配，其他 IUPAC 组合（含兼容的歧义碱基）均算错配。
+- 输出 JSON 按固定顺序包含 `reference`、`query`、`mode`、`score`、`reference_start`、`reference_end`、`query_start`、`query_end`、`cigar`、`aligned_reference`、`aligned_query`；坐标零基、右端不含，对齐串中缺口记为 `-`。
+- CIGAR 使用 `=`、`X`、`I`、`D` 四种操作：`I` 只消耗查询、`D` 只消耗参考，相邻同类操作合并为一项。
+- 同分时依次选择 `reference_start`、`query_start`、`reference_end`、`query_end` 较小者，仍相同则选择 CIGAR 字典序较小者。
+- `REFERENCE`/`QUERY` 与 `--output` 为 `-` 时沿用标准流约定（默认输出到标准输出），但两个输入不能同时为标准输入；成功输出末尾恰有一个 `\n`。
+- 输出到文件时先完成全部校验与比对，再经同目录临时文件原子替换；任一读取、校验或比对错误都不改变已有目标、不留下部分结果。
+- 返回码：成功 `0`；参数错误、空输入、多条记录、双标准输入、格式或序列错误返回 `2`（标准错误单行消息，标准输出为空）；文件读写错误返回 `1`。相同输入与参数产生逐字节相同的输出。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -100,6 +124,10 @@ genome-variant-toolkit kmer-index INPUT --k N \
 - `KmerOccurrence(record, id, position, strand)`：一次 k-mer 出现，含零基记录序号、记录标识、零基序列起点与方向（`+` 或 `-`）。
 - `build_kmer_index(records, k, canonical=True)`：接收 `SequenceRecord` 可迭代对象，返回以 k-mer 为键、按键字典序排列的映射，值为按输入顺序排列的 `KmerOccurrence` 列表。`canonical` 为真时以正向片段及其反向互补中字典序较小者为键（反向互补来源标 `-`，回文固定 `+`），为假时仅索引正向片段并标 `+`；含非 `ACGT` 符号的窗口跳过，短于 k 的记录无条目，重复标识不合并。`k` 只接受至少为 1 的非布尔整数，`canonical` 只接受布尔值，非法参数在消费 `records` 前抛出 `ValueError`；记录含非法碱基时在迭代到该记录时抛出 `SequenceValidationError`。
 
+模块 `genome_variant.alignment` 提供：
+
+- `align_pair(reference, query, mode="global", match_score=2, mismatch_penalty=2, gap_open_penalty=2, gap_extend_penalty=1)`：对两个 `SequenceRecord` 进行仿射罚分成对比对（FASTQ 质量不参与打分），返回固定键顺序的结果字典，键依次为 `reference`、`query`、`mode`、`score`、`reference_start`、`reference_end`、`query_start`、`query_end`、`cigar`、`aligned_reference`、`aligned_query`，坐标零基、右端不含，对齐串缺口记为 `-`。`mode` 为 `global`（覆盖两条完整序列）或 `local`（只返回正分最佳片段；无正分片段时分数与四坐标均为 0、对齐串与 CIGAR 为空）。长度 L 的连续缺口扣 `gap_open + gap_extend × (L-1)`，仅完全相同的字符算匹配，其他 IUPAC 组合（含兼容歧义碱基）均算错配；CIGAR 使用合并后的 `=`/`X`/`I`/`D`，`I` 只消耗查询、`D` 只消耗参考。同分依次选择 `reference_start`、`query_start`、`reference_end`、`query_end` 较小者，再选 CIGAR 字典序较小者。`match_score` 只接受正整数、三个罚分只接受非负整数，布尔值一律非法，非法参数在检查记录前抛出 `ValueError`；序列含非法碱基抛出 `SequenceValidationError`。
+
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 
 异常：
@@ -111,4 +139,4 @@ genome-variant-toolkit kmer-index INPUT --k N \
 
 ## 限制
 
-- 仅支持文本 FASTA/FASTQ 与 IUPAC DNA 符号，尚不支持比对、变异调用等后续流程。
+- 仅支持文本 FASTA/FASTQ 与 IUPAC DNA 符号；已提供 global/local 成对序列比对，尚不支持变异调用等后续流程。
