@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -19,6 +20,13 @@ from .sequence_io import (
     SequenceValidationError,
     read_sequences,
     write_sequences,
+)
+from .vcf import (
+    ReferenceMismatchError,
+    VcfFormatError,
+    normalize_vcf,
+    read_vcf,
+    write_vcf,
 )
 
 # Read/parse/processing errors that make the invocation invalid usage.
@@ -249,6 +257,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    normalize_vcf_cmd = sub.add_parser(
+        "normalize-vcf",
+        help="normalize a VCF against a reference FASTA",
+    )
+    normalize_vcf_cmd.add_argument(
+        "input", help="VCF input file, or '-' for standard input"
+    )
+    normalize_vcf_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file, or '-' for standard input (required)",
+    )
+    normalize_vcf_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -275,6 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "align-pair":
         return _run_align_pair(args, parser)
+
+    if args.command == "normalize-vcf":
+        return _run_normalize_vcf(args, parser)
 
     if args.command == "kmer-index":
         return _run_kmer_index(args, parser)
@@ -672,6 +701,118 @@ def _run_align_pair(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             ref_stream.close()
         if close_query:
             query_stream.close()
+
+    return 0
+
+
+def _run_normalize_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.input == "-" and args.reference == "-":
+        print(
+            f"{parser.prog}: input and reference cannot both be read from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.input == "-":
+        vcf_stream = sys.stdin
+        close_vcf = False
+        vcf_source = "<stdin>"
+    else:
+        try:
+            vcf_stream = open(args.input, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        close_vcf = True
+        vcf_source = args.input
+
+    try:
+        # Parse the whole VCF before touching the output: a failure never
+        # produces partial output.
+        try:
+            header, records = read_vcf(vcf_stream)
+        except VcfFormatError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        if args.reference == "-":
+            reference_stream = sys.stdin
+            close_reference = False
+        else:
+            try:
+                reference_stream = open(
+                    args.reference, "r", encoding="utf-8", newline=""
+                )
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            close_reference = True
+
+        try:
+            reference_records = read_sequences(reference_stream, format="fasta")
+            try:
+                normalized = normalize_vcf(
+                    records, reference_records, source=vcf_source
+                )
+                buffer = io.StringIO()
+                write_vcf(header, normalized, buffer)
+                text = buffer.getvalue()
+            except (
+                VcfFormatError,
+                ReferenceMismatchError,
+                SequenceFormatError,
+                SequenceValidationError,
+                ValueError,
+            ) as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 2
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if close_reference:
+                reference_stream.close()
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".normalize-vcf-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_vcf:
+            vcf_stream.close()
 
     return 0
 

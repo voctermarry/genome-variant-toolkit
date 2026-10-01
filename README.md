@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引以及成对序列比对功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对以及参考序列感知的 VCF 规范化功能。
 
 ## 环境与安装
 
@@ -103,6 +103,23 @@ genome-variant-toolkit align-pair REFERENCE QUERY \
 - 输出到文件时仅在全部校验与比对成功后经同目录临时文件原子替换；失败保留已有内容且无部分结果。相同输入与参数产生逐字节相同的输出。
 - 返回码：成功 `0`；参数错误、空输入、多条记录、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
 
+### normalize-vcf
+
+读取 VCF，按参考 FASTA 校验并规范化后写出：
+
+```bash
+genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE [--output OUTPUT]
+```
+
+- `INPUT`、`--reference` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），`--reference` 为必填的参考 FASTA；VCF 输入与参考不能同时为标准输入。
+- `##` 元信息行按原有内容与顺序保留；要求恰有一条合法的 `#CHROM` 列头，记录的固定列、FORMAT 与样本列数必须与列头一致；记录按输入顺序处理与写出，顺序不变。
+- 普通序列型 REF/ALT 统一为大写并限于 IUPAC DNA 符号；符号 ALT（`<DEL>` 等）、断点 ALT、`*` 与 `.` 原样保留。
+- 规范化按 CHROM 在参考中查找唯一序列，先验证 POS 对应的 REF 片段，再把一个记录内全部序列型等位基因作为整体移除共同的最长后缀与前缀（每个等位基因始终保留至少一个碱基，POS 同步前移）；存在长度差时继续左移到表示相同单倍型的最小 POS，每次移动后重新最简化。含任一符号、断点、`*` 或 `.` ALT 的记录不剪裁也不左移，但仍校验 REF。ALT 次序以及 ID、QUAL、FILTER、INFO、FORMAT 和样本文本保持不变。
+- 缺少或重复列头、列数不符、非正整数 POS、空或非法 REF/ALT 以及越界记录为 VCF 格式错误；参考中缺少或重复 CHROM、或 REF 与参考不一致为参考不匹配错误。
+- 输出使用制表符分隔与 `\n` 换行，末尾恰有一个换行符；空记录 VCF 仍写完整头部；相同输入与参考产生逐字节相同的输出。
+- 输出到文件时在全部记录验证成功后经同目录临时文件原子替换；失败保留已有内容且无部分结果。
+- 返回码：成功 `0`；参数错误、两边同时使用标准输入、VCF 格式错误、参考不匹配或参考序列格式错误均为 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -125,6 +142,14 @@ genome-variant-toolkit align-pair REFERENCE QUERY \
 - `PairwiseAlignment`：不可变结果对象，字段依次为 `reference`、`query`（记录标识）、`mode`、`score`、`reference_start`、`reference_end`、`query_start`、`query_end`、`cigar`、`aligned_reference`、`aligned_query`；坐标零基、右端不含，对齐串等长且以 `-` 表示缺口。
 - `align_pair(reference, query, mode="global", match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2)`：比对两个 `SequenceRecord`。`mode` 为 `global`（覆盖两条完整序列）或 `local`（只取正分最佳片段；无正分片段时返回 0 分、四个坐标均为 0、空 CIGAR 与空对齐串）。长度为 `L` 的连续缺口扣 `gap_open + gap_extend × (L-1)`；仅完全相同字符算匹配，其他 IUPAC 组合均算错配；质量值不参与打分。同分时依次选择四个坐标较小者，仍相同则选择 CIGAR 字典序较小者。`match_score` 必须为非布尔正整数，三个罚分必须为非布尔非负整数，`mode` 非法时在处理记录前抛出 `ValueError`；非法碱基抛出 `SequenceValidationError`。
 
+模块 `genome_variant.vcf` 提供：
+
+- `VcfHeader(meta_lines, columns)`：VCF 头部；`meta_lines` 为按原有内容与顺序保留的 `##` 行（含 `##` 前缀），`columns` 为 `#CHROM` 列头的全部字段（八个固定列，可选 FORMAT 与样本列）；`sample_names` 属性返回样本列名。
+- `VcfRecord(chrom, pos, id=".", ref="", alts=(), qual=".", filter=".", info=".", format=None, samples=(), line_number=0)`：一条 VCF 记录；`ref` 与序列型 `alts` 为大写 IUPAC 序列，符号、断点、`*`、`.` 等位基因原样保留，`format` 为 `None` 表示无 FORMAT 列，`line_number` 为一基来源行号（写出时忽略）。
+- `read_vcf(source)`：接受文本路径或文本流，返回 `(VcfHeader, list[VcfRecord])`，记录按输入顺序排列；`##` 元信息原样保留，要求恰有一条合法的 `#CHROM` 列头，记录列数必须与列头一致。
+- `normalize_vcf(records, reference, source="<stream>")`：按参考校验并规范化记录，返回同序的新记录列表。`reference` 为「CHROM → 序列」映射或 `SequenceRecord` 可迭代对象；重复 CHROM 视为参考不匹配。先验证 POS 对应的 REF 片段，再把记录内全部序列型等位基因作为整体移除共同最长后缀与前缀（每个等位基因至少保留一个碱基，POS 同步调整），存在长度差时继续左移到表示相同单倍型的最小 POS 并在每次移动后重新最简化；含符号、断点、`*` 或 `.` ALT 的记录只校验不修改。`source` 用于越界错误消息中的来源名。
+- `write_vcf(header, records, output)`：向文本路径或文本流写 VCF；`##` 行原样写出，记录按制表符分隔、`\n` 换行，末尾恰有一个换行符，空记录仍写完整头部。
+
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 
 异常：
@@ -132,6 +157,8 @@ genome-variant-toolkit align-pair REFERENCE QUERY \
 - `SequenceFormatError`：空输入、无法判定格式、空标识、空序列、标题前出现内容、FASTQ 结构不完整或长度不等；消息包含来源名与一基行号。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
+- `VcfFormatError`（位于 `genome_variant.vcf`）：缺少或重复列头、列数不符、非正整数 POS、空或非法 REF/ALT 以及越界记录；消息包含来源与一基行号。
+- `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 和可判定的期望值与实际值，并以同名属性携带。
 - 打开路径失败保留 `OSError`，迭代期间的其他异常不会被吞掉。
 
 ## 限制
