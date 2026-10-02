@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV 变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、参考序列覆盖度与一致性统计、单样本 SNV 变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
 
 ## 环境与安装
 
@@ -122,6 +122,25 @@ genome-variant-toolkit map-reads REFERENCE READS \
 - 输出统一使用 `\n`，非空结果末尾恰有一个换行符（每条读段恰好对应一行，故成功输出不会为空）；写文件时仅在全部读段成功处理后经同目录临时文件原子替换，任一读取、校验或处理失败都保留已有目标且不留部分结果。相同输入与参数无论如何分批都产生逐字节相同的结果。
 - 返回码：成功 `0`；参数错误、空参考/空读段输入、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### coverage-report
+
+在多记录 FASTA 参考上按 `map-reads` 的语义映射 FASTA/FASTQ 读段，并按参考输入顺序输出每条参考的覆盖度与一致性统计（紧凑 JSON Lines，每条参考一行，无命中也输出）；FASTQ 质量值不参与统计：
+
+```bash
+genome-variant-toolkit coverage-report REFERENCE READS \
+    [--reads-format fasta|fastq|auto] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
+    [--output OUTPUT]
+```
+
+- 输入、`--reads-format`、全部映射与计分选项（默认 `--match 2`、`--mismatch 3`、`--gap-open 5`、`--gap-extend 2`、`--min-score 1`）、`--output` 与标准流约定均与 `map-reads` 一致：`REFERENCE` 按 FASTA 解析，`READS` 为 FASTA 或 FASTQ，两个输入不能同时为标准输入，局部比对、正反链搜索、最低分门槛与候选裁决完全相同。
+- 每条读段只采用唯一胜出的映射，未映射读段不计入。胜出 CIGAR 的每个 `=` 与 `X` 列在对应参考位置增加一次深度，`D` 推进参考位置但不增加深度，`I` 没有参考位置；一致性仅指字符逐字相同（包括 IUPAC 字符，如 `R` 对 `R` 一致、`R` 对 `A` 不一致）。重复参考标识不合并。
+- 每行固定按顺序包含 `reference_record`（零基参考输入序号）、`reference`、`length`、`mapped_reads`（胜出映射落在该参考的读段数）、`observed_bases`（`=`/`X` 列总数）、`covered_bases`（深度非零的位置数）、`coverage_fraction`、`mean_depth`、`concordant_bases`、`concordance_fraction`。
+- 三个小数字段均为固定六位小数字符串：`coverage_fraction = covered_bases/length`，`mean_depth = observed_bases/length`，`concordance_fraction = concordant_bases/observed_bases`；分母为零时取 `"0.000000"`。
+- 输出统一使用 UTF-8 与 `\n`，末尾恰有一个换行符（每条参考恰好对应一行，故成功输出不会为空）。写文件时仅在全部校验与统计完成后经同目录临时文件原子替换，失败保留已有目标且不留部分结果。读段分批不改变相同输入的输出字节。
+- 返回码：成功 `0`；参数错误、空参考（抛 `MappingReferenceError`）、空读段输入、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
+
 ### call-variants
 
 从多记录参考 FASTA 与 FASTQ 读段调用单样本 SNV，输出可被现有 VCF 接口读回的 VCFv4.2 文档；映射沿用 `map-reads` 的局部比对计分、正反链搜索与候选裁决，质量不参与映射打分、只过滤碱基证据：
@@ -207,6 +226,11 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 - `MappingReferenceError`（`ValueError` 子类）：参考记录集合为空时抛出。
 - `ReadMapping`：不可变结果对象，字段依次为 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考输入序号）、`reference`（参考标识）、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；坐标零基、右端不含；未映射时除 `record`、`id`、`mapped` 外其余字段均为 `None`。
 - `map_reads(references, reads, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：把读段惰性映射到多条参考，按读段输入顺序产生 `ReadMapping`。每条读段分别以原序列与完整 IUPAC 反向互补序列与每条参考做局部比对（计分语义同 `align_pair` 的 `local`），仅保留分数不低于 `min_score` 的候选；同分依次按参考输入序号、`reference_start`、`reference_end`、正链优先、原读段上的 `query_start`、`query_end`、CIGAR 字典序裁决。负链查询坐标换算回原读段，CIGAR 仍按参考与反向互补读段解释；无达标候选时仍产生未映射结果，重复标识不合并。`min_score` 必须为非布尔正整数，计分参数约束同 `align_pair`，非法参数在消费任一输入前抛出 `ValueError`；参考集合为空在消费 `reads` 前抛出 `MappingReferenceError`；非法碱基在迭代到该记录时抛出 `SequenceValidationError`。
+
+模块 `genome_variant.coverage` 提供：
+
+- `CoverageStats`：不可变统计对象，字段依次为 `reference_record`（零基参考输入序号）、`reference`（参考标识）、`length`、`mapped_reads`（唯一胜出映射落在该参考的读段数）、`observed_bases`（`=`/`X` 列总数）、`covered_bases`（深度非零的参考位置数）、`concordant_bases`（`=` 列数，即字符逐字相同的观测数）；`to_dict()` 按固定顺序返回 JSON 对象并额外给出 `coverage_fraction`（`covered_bases/length`）、`mean_depth`（`observed_bases/length`）与 `concordance_fraction`（`concordant_bases/observed_bases`），三者均为固定六位小数字符串，分母为零时为 `"0.000000"`。
+- `coverage_report(references, reads, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：按 `map_reads` 完全相同的局部比对计分、正反链搜索、最低分门槛与候选裁决映射每条读段，只采用每条读段唯一胜出的映射、忽略未映射读段，按参考输入顺序惰性产生每参考一条 `CoverageStats`（无命中也产生，重复标识不合并）。胜出 CIGAR 的 `=`、`X` 各为对应参考位置增加一次深度（`=` 同时计入一致），`D` 推进参考位置但不加深度，`I` 无参考位置；一致性仅按字符逐字相同判定（包括 IUPAC 字符），质量值不参与统计。参数校验与错误时机同 `map_reads`：非法参数在消费任一输入前抛 `ValueError`，空参考集合在消费 `reads` 前抛 `MappingReferenceError`，非法碱基在迭代到该记录时抛 `SequenceValidationError`；读段分批不影响结果。
 
 模块 `genome_variant.calling` 提供：
 
