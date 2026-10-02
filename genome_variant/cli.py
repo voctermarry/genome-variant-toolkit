@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from collections.abc import Iterable, Iterator, Sequence
 
 from . import __version__
 from .alignment import PairwiseAlignment, align_pair
+from .calling import VariantCallingError, call_variants
 from .kmer import build_kmer_index
 from .mapping import MappingReferenceError, map_reads
 from .quality import ReadQualityError, filter_reads
@@ -75,6 +77,20 @@ def _nonnegative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError(
             f"{value!r} is not a non-negative integer"
+        )
+    return parsed
+
+
+def _fraction(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a finite number between 0 and 1"
+        )
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a finite number between 0 and 1"
         )
     return parsed
 
@@ -338,6 +354,102 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    call_variants_cmd = sub.add_parser(
+        "call-variants",
+        help="call single-sample SNVs from reads against a FASTA reference",
+    )
+    call_variants_cmd.add_argument(
+        "reference", help="reference FASTA file, or '-' for standard input"
+    )
+    call_variants_cmd.add_argument(
+        "reads", help="reads FASTA/FASTQ file, or '-' for standard input"
+    )
+    call_variants_cmd.add_argument(
+        "--reads-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="reads input format (default: auto-detect)",
+    )
+    call_variants_cmd.add_argument(
+        "--min-base-quality",
+        type=_quality_int,
+        default=20,
+        metavar="N",
+        help="minimum Phred quality for a base to count as evidence "
+        "(default: 20)",
+    )
+    call_variants_cmd.add_argument(
+        "--min-alt-count",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="minimum ALT observation count to emit a record (default: 2)",
+    )
+    call_variants_cmd.add_argument(
+        "--min-alt-fraction",
+        type=_fraction,
+        default=0.2,
+        metavar="F",
+        help="minimum AC/DP fraction to emit a record (default: 0.2)",
+    )
+    call_variants_cmd.add_argument(
+        "--homozygous-fraction",
+        type=_fraction,
+        default=0.8,
+        metavar="F",
+        help="ALT fraction at or above which the genotype is 1/1 "
+        "(default: 0.8)",
+    )
+    call_variants_cmd.add_argument(
+        "--sample-name",
+        default="SAMPLE",
+        help="sample name for the VCF #CHROM header (default: SAMPLE)",
+    )
+    call_variants_cmd.add_argument(
+        "--match",
+        "--match-score",
+        dest="match",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="match score, a positive integer (default: 2)",
+    )
+    call_variants_cmd.add_argument(
+        "--mismatch",
+        "--mismatch-penalty",
+        dest="mismatch",
+        type=_nonnegative_int,
+        default=3,
+        metavar="N",
+        help="mismatch penalty, a non-negative integer (default: 3)",
+    )
+    call_variants_cmd.add_argument(
+        "--gap-open",
+        type=_nonnegative_int,
+        default=5,
+        metavar="N",
+        help="gap opening penalty, a non-negative integer (default: 5)",
+    )
+    call_variants_cmd.add_argument(
+        "--gap-extend",
+        type=_nonnegative_int,
+        default=2,
+        metavar="N",
+        help="gap extension penalty, a non-negative integer (default: 2)",
+    )
+    call_variants_cmd.add_argument(
+        "--min-score",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="minimum local-alignment score to consider mapped (default: 1)",
+    )
+    call_variants_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -370,6 +482,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "map-reads":
         return _run_map_reads(args, parser)
+
+    if args.command == "call-variants":
+        return _run_call_variants(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -953,6 +1068,123 @@ def _run_map_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 
         output_stream, temporary_path = _open_temporary_output(
             args.output, parser, prefix=".map-reads-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_ref:
+            ref_stream.close()
+        if close_reads:
+            read_stream.close()
+
+    return 0
+
+
+def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.reference == "-" and args.reads == "-":
+        print(
+            f"{parser.prog}: reference and reads cannot both be read from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validate the cross-parameter rule before any input is consumed; the
+    # individual ranges were already enforced by argparse types.
+    if args.homozygous_fraction < args.min_alt_fraction:
+        print(
+            f"{parser.prog}: error: --homozygous-fraction must be at least "
+            "--min-alt-fraction",
+            file=sys.stderr,
+        )
+        return 2
+
+    ref_stream, close_ref, ref_code = _open_input(args.reference, parser)
+    if ref_stream is None:
+        return ref_code
+    read_stream, close_reads, reads_code = _open_input(args.reads, parser)
+    if read_stream is None:
+        if close_ref:
+            ref_stream.close()
+        return reads_code
+
+    try:
+        # Read and validate everything, and finish all calling, before an
+        # output file is created so a failure preserves the existing target.
+        try:
+            reference_records = list(read_sequences(ref_stream, format="fasta"))
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            read_records = list(read_sequences(read_stream, format=args.reads_format))
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            document = call_variants(
+                reference_records,
+                read_records,
+                min_base_quality=args.min_base_quality,
+                min_alt_count=args.min_alt_count,
+                min_alt_fraction=args.min_alt_fraction,
+                homozygous_fraction=args.homozygous_fraction,
+                sample_name=args.sample_name,
+                match_score=args.match,
+                mismatch_penalty=args.mismatch,
+                gap_open=args.gap_open,
+                gap_extend=args.gap_extend,
+                min_score=args.min_score,
+            )
+        except (
+            VariantCallingError,
+            MappingReferenceError,
+            ReadQualityError,
+            SequenceValidationError,
+            ValueError,
+        ) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        text = render_vcf(document)
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".call-variants-"
         )
         if output_stream is None:
             return 1

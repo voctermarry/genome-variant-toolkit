@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射以及参考序列感知的 VCF 规范化功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、从读段调用单样本 SNV 以及参考序列感知的 VCF 规范化功能。
 
 ## 环境与安装
 
@@ -122,6 +122,30 @@ genome-variant-toolkit map-reads REFERENCE READS \
 - 输出统一使用 `\n`，非空结果末尾恰有一个换行符（每条读段恰好对应一行，故成功输出不会为空）；写文件时仅在全部读段成功处理后经同目录临时文件原子替换，任一读取、校验或处理失败都保留已有目标且不留部分结果。相同输入与参数无论如何分批都产生逐字节相同的结果。
 - 返回码：成功 `0`；参数错误、空参考/空读段输入、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### call-variants
+
+把 FASTA/FASTQ 读段映射到多记录 FASTA 参考上，调用单样本 SNV 并输出 VCFv4.2：
+
+```bash
+genome-variant-toolkit call-variants REFERENCE READS \
+    [--reads-format fasta|fastq|auto] \
+    [--min-base-quality N] [--min-alt-count N] \
+    [--min-alt-fraction F] [--homozygous-fraction F] \
+    [--sample-name NAME] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
+    [--output OUTPUT]
+```
+
+- `REFERENCE` 按 FASTA 解析，可含多条参考记录且标识不得重复；`READS` 为 FASTA 或 FASTQ，默认自动识别（可用 `--reads-format` 指定）。两者与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但两个输入不能同时为标准输入。
+- 映射完全沿用 `map-reads`：局部比对计分（默认 `--match 2`、`--mismatch 3`、`--gap-open 5`、`--gap-extend 2`、`--min-score 1`）、正反链搜索与候选裁决；质量值不参与映射打分，只用于过滤碱基证据。
+- 仅统计 A、C、G、T 之间的替换：插入、缺失、未对齐部分、未映射读段与歧义碱基一律忽略。每条已映射读段在同一参考位置最多贡献一次观测；负链观测的碱基按正向参考报告，其 Phred 质量取原读段对应位置。
+- 仅接纳质量不低于 `--min-base-quality`（默认 20，0 至 93 的整数）的碱基；`DP` 为通过门槛的 `ACGT` 观测总数。非参考碱基中计数最高者为唯一 ALT；计数并列时按 `A、C、G、T` 选择。
+- 仅当 ALT 计数达到 `--min-alt-count`（默认 2，正整数）且 `AC/DP` 不低于 `--min-alt-fraction`（默认 0.2，0 至 1 的有限数）时输出记录；ALT 比例不低于 `--homozygous-fraction`（默认 0.8，且不得低于 `--min-alt-fraction`）时 `GT` 为 `1/1`，否则为 `0/1`。
+- 输出可被现有 VCF 接口读取：首行为 `##fileformat=VCFv4.2`；样本名默认 `SAMPLE`（`--sample-name` 不得为空、纯空白或含制表符）；记录按参考输入次序与 POS 升序排列；`REF`、`ALT` 大写，`ID` 为点，`QUAL` 为点，`FILTER` 为 `PASS`，`INFO` 为 `DP`、`AC`、`AF`（`AF` 固定六位小数），`FORMAT` 为 `GT:DP:AD`，`AD` 为参考与所选 ALT 的计数。无候选时仍输出完整头部。
+- 全部读段读取与调用成功后才经同目录临时文件原子替换输出；任一失败保留已有目标且不留部分结果。相同输入与参数无论如何分批都产生逐字节相同的结果。
+- 返回码：成功 `0`；参数错误、非法阈值（在消费输入前报错）、空参考、重复参考标识、非法样本名、两边同时使用标准输入、缺少/长度错误的质量值、序列或 FASTQ 格式错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
+
 ### normalize-vcf
 
 读取 VCF 并结合必需的参考 FASTA 进行参考序列感知的规范化（等位基因最简化与左对齐）：
@@ -168,6 +192,11 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `ReadMapping`：不可变结果对象，字段依次为 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考输入序号）、`reference`（参考标识）、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；坐标零基、右端不含；未映射时除 `record`、`id`、`mapped` 外其余字段均为 `None`。
 - `map_reads(references, reads, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：把读段惰性映射到多条参考，按读段输入顺序产生 `ReadMapping`。每条读段分别以原序列与完整 IUPAC 反向互补序列与每条参考做局部比对（计分语义同 `align_pair` 的 `local`），仅保留分数不低于 `min_score` 的候选；同分依次按参考输入序号、`reference_start`、`reference_end`、正链优先、原读段上的 `query_start`、`query_end`、CIGAR 字典序裁决。负链查询坐标换算回原读段，CIGAR 仍按参考与反向互补读段解释；无达标候选时仍产生未映射结果，重复标识不合并。`min_score` 必须为非布尔正整数，计分参数约束同 `align_pair`，非法参数在消费任一输入前抛出 `ValueError`；参考集合为空在消费 `reads` 前抛出 `MappingReferenceError`；非法碱基在迭代到该记录时抛出 `SequenceValidationError`。
 
+模块 `genome_variant.calling` 提供：
+
+- `VariantCallingError`（`ValueError` 子类）：参考记录集合为空、参考标识重复，或样本名为空、纯空白或含制表符时抛出。
+- `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE", match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：以与 `map_reads` 相同的局部比对计分、正反链搜索与候选裁决把每条读段映射到参考（质量不参与打分），堆积质量过滤后的碱基证据并返回可由 `read_vcf` 读取的 VCFv4.2 `VcfFile`。每条已映射读段在同一参考位置最多贡献一次观测，仅统计双方均为 `ACGT` 的比对列；插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；负链观测碱基按正向参考报告、质量取原读段对应位置。`DP` 为通过 `min_base_quality` 的观测总数；最高频非参考碱基为唯一 ALT（并列按 `A、C、G、T`）；ALT 计数达到 `min_alt_count` 且比例达到 `min_alt_fraction` 才输出；比例达到 `homozygous_fraction` 时 `GT=1/1`，否则 `0/1`；`INFO` 为 `DP;AC;AF`（AF 六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 为 0 至 93 的非布尔整数，`min_alt_count` 为正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例，计分参数约束同 `map_reads`；非法参数在消费任一输入前抛出 `ValueError`；空参考或重复标识抛出 `VariantCallingError`；读段缺少质量值或质量长度不符在迭代到该记录时抛出 `ReadQualityError`，非法碱基抛出 `SequenceValidationError`。
+
 模块 `genome_variant.vcf` 提供：
 
 - `VcfHeader(meta_lines=(), samples=())`：`meta_lines` 为按输入顺序保留的 `##` 元信息行（不含行终止符），`samples` 为 `#CHROM` 列头声明的样本名元组；属性 `column_names` 给出完整列头。
@@ -186,6 +215,7 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
+- `VariantCallingError`（`ValueError` 子类，位于 `genome_variant.calling`）：调用时参考集合为空、参考标识重复，或样本名为空、纯空白或含制表符。
 - 打开路径失败保留 `OSError`，迭代期间的其他异常不会被吞掉。
 
 ## 限制
