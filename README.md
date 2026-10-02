@@ -144,6 +144,24 @@ genome-variant-toolkit call-variants REFERENCE READS \
 - 无候选时仍输出完整头部（7 行 `##` 元信息加 `#CHROM` 列头）。写文件时仅在全部读取与调用成功后经同目录临时文件原子替换，失败保留原目标；读段分批不影响逐字节结果。
 - 返回码：成功 `0`；参数错误、非法阈值（在消费输入前报错）、空参考、重复参考标识、非法样本名、缺少质量或质量长度错误、FASTQ 与序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### coverage-report
+
+统计多记录参考 FASTA 的覆盖度与一致性，按参考输入顺序输出 JSON Lines，每条参考记录一行；映射沿用 `map-reads` 的局部比对计分、正反链搜索与候选裁决，FASTQ 质量值不参与统计：
+
+```bash
+genome-variant-toolkit coverage-report REFERENCE READS \
+    [--reads-format fasta|fastq|auto] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
+    [--output OUTPUT]
+```
+
+- 输入、映射选项（`--match`、`--mismatch`、`--gap-open`、`--gap-extend`、`--min-score`）、`--output` 与标准流约定均同 `map-reads`；两个输入不能同时为标准输入。
+- 每条读段只采用唯一胜出的映射，未映射读段不计入。CIGAR 的 `=` 与 `X` 各为对应参考位置增加一次深度，`D` 不增加，`I` 无参考位置；一致仅指观测字符与参考字符逐字相同（包括 IUPAC 字符，如 `N` 对 `N` 一致、`R` 对 `A` 不一致）。
+- 每条参考记录输出一行，无命中也输出，重复标识不合并、以零基 `reference_record` 区分。每行固定按顺序包含 `reference_record`、`reference`、`length`、`mapped_reads`、`observed_bases`（深度总和）、`covered_bases`（深度非零的位置数）、`coverage_fraction`、`mean_depth`、`concordant_bases`、`concordance_fraction`；三个小数分别按 `covered_bases/length`、`observed_bases/length`、`concordant_bases/observed_bases` 计算，分母为零取 `0`，均为固定六位小数字符串。
+- 成功输出为 UTF-8 与 `\n`，末尾恰有一个换行；写文件时仅在全部校验与统计完成后经同目录临时文件原子替换，失败保留已有目标。相同输入与参数无论如何分批都产生逐字节相同的结果。
+- 返回码：成功 `0`；参数错误、空参考/空读段输入、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
+
 ### normalize-vcf
 
 读取 VCF 并结合必需的参考 FASTA 进行参考序列感知的规范化（等位基因最简化与左对齐）：
@@ -212,6 +230,11 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 
 - `VariantCallingError`（`ValueError` 子类）：参考集合为空、参考标识重复或样本名为空、纯空白、含制表符（或非字符串）时抛出。
 - `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE")`：返回可由 `read_vcf` 读回的 `VcfFile`（VCFv4.2，单样本）。映射与 `map_reads` 使用相同的局部比对计分（固定默认值）、正反链搜索与候选裁决；质量不参与映射，只过滤碱基证据。仅统计参考碱基与观测碱基都属于 `ACGT` 的比对列，插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；每条已映射读段在同一参考位置至多贡献一次观测，负链观测碱基按参考正链报告而质量取自原读段对应位置。`DP` 为通过质量门槛的 `ACGT` 观测总数，唯一 ALT 为非参考碱基中计数最高者（并列按 `A`、`C`、`G`、`T`），ALT 计数至少 `min_alt_count` 且 `AC/DP` 至少 `min_alt_fraction` 才输出记录；比例不低于 `homozygous_fraction` 时 GT 为 `1/1`，否则 `0/1`。记录按参考输入次序与 POS 升序排列，`INFO` 为 `DP`、`AC`、`AF`（六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 限于 0 至 93 的非布尔整数，`min_alt_count` 为非布尔正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例；非法阈值在消费任一输入前抛出 `ValueError`，样本名与参考错误抛出 `VariantCallingError`，读段缺少质量、质量长度错误或质量越界在迭代到该读段时抛出 `ReadQualityError`。
+
+模块 `genome_variant.coverage` 提供：
+
+- `ReferenceCoverage`：不可变结果对象，字段依次为 `reference_record`（零基参考输入序号）、`reference`、`length`、`mapped_reads`、`observed_bases`、`covered_bases`、`coverage_fraction`、`mean_depth`、`concordant_bases`、`concordance_fraction`；三个小数字段为固定六位小数字符串，分母为零时为 `"0.000000"`。
+- `coverage_report(references, reads, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：按 `map_reads` 的映射语义（相同的局部比对计分、正反链搜索与候选裁决）聚合每条参考记录的覆盖度与一致性，按参考输入顺序产生 `ReferenceCoverage`，无命中的参考也产生结果，重复标识不合并。每条读段只采用唯一胜出的映射；`=`/`X` 列各为对应参考位置增加一次深度，`D` 不增加、`I` 无参考位置；一致仅指字符逐字相同（含 IUPAC 字符）；质量值不参与。参数校验与异常时序同 `map_reads`：非法参数在消费任一输入前抛出 `ValueError`，空参考在消费 `reads` 前抛出 `MappingReferenceError`，非法碱基在迭代到该记录时抛出 `SequenceValidationError`。
 
 模块 `genome_variant.vcf` 提供：
 
