@@ -12,6 +12,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from . import __version__
 from .alignment import PairwiseAlignment, align_pair
 from .kmer import build_kmer_index
+from .mapping import ReadMapping, map_reads
 from .quality import ReadQualityError, filter_reads
 from .sequence_io import (
     SequenceFormatError,
@@ -259,6 +260,69 @@ def _build_parser() -> argparse.ArgumentParser:
         help="output file, or '-' for standard output (default: standard output)",
     )
 
+    map_reads_cmd = sub.add_parser(
+        "map-reads",
+        help="map reads against a multi-record reference and write JSON Lines",
+    )
+    map_reads_cmd.add_argument(
+        "reference", help="reference FASTA file, or '-' for standard input"
+    )
+    map_reads_cmd.add_argument(
+        "reads", help="reads input file (FASTA or FASTQ), or '-' for standard input"
+    )
+    map_reads_cmd.add_argument(
+        "--reads-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="reads input format (default: auto-detect)",
+    )
+    map_reads_cmd.add_argument(
+        "--match",
+        "--match-score",
+        dest="match",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="match score, a positive integer (default: 2)",
+    )
+    map_reads_cmd.add_argument(
+        "--mismatch",
+        "--mismatch-penalty",
+        dest="mismatch",
+        type=_nonnegative_int,
+        default=3,
+        metavar="N",
+        help="mismatch penalty, a non-negative integer (default: 3)",
+    )
+    map_reads_cmd.add_argument(
+        "--gap-open",
+        type=_nonnegative_int,
+        default=5,
+        metavar="N",
+        help="gap opening penalty, a non-negative integer (default: 5)",
+    )
+    map_reads_cmd.add_argument(
+        "--gap-extend",
+        type=_nonnegative_int,
+        default=2,
+        metavar="N",
+        help="gap extension penalty, a non-negative integer (default: 2)",
+    )
+    map_reads_cmd.add_argument(
+        "--min-score",
+        dest="min_score",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="minimum local alignment score to accept a candidate, a "
+        "positive integer (default: 1)",
+    )
+    map_reads_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
+
     normalize_vcf_cmd = sub.add_parser(
         "normalize-vcf",
         help="normalize VCF variants against a reference FASTA",
@@ -302,6 +366,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "align-pair":
         return _run_align_pair(args, parser)
+
+    if args.command == "map-reads":
+        return _run_map_reads(args, parser)
 
     if args.command == "normalize-vcf":
         return _run_normalize_vcf(args, parser)
@@ -702,6 +769,125 @@ def _run_align_pair(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             ref_stream.close()
         if close_query:
             query_stream.close()
+
+    return 0
+
+
+def _mapping_to_json(result: ReadMapping) -> str:
+    return json.dumps(
+        {
+            "record": result.record,
+            "id": result.id,
+            "mapped": result.mapped,
+            "reference_record": result.reference_record,
+            "reference": result.reference,
+            "reference_start": result.reference_start,
+            "reference_end": result.reference_end,
+            "query_start": result.query_start,
+            "query_end": result.query_end,
+            "strand": result.strand,
+            "score": result.score,
+            "cigar": result.cigar,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _run_map_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.reference == "-" and args.reads == "-":
+        print(
+            f"{parser.prog}: reference and reads cannot both be read "
+            "from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    ref_stream, close_ref, code = _open_input(args.reference, parser)
+    if ref_stream is None:
+        return code
+    reads_stream, close_reads, reads_code = _open_input(args.reads, parser)
+    if reads_stream is None:
+        if close_ref:
+            ref_stream.close()
+        return reads_code
+
+    try:
+        try:
+            reference_records = list(read_sequences(ref_stream, format="fasta"))
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 1
+
+        # Map every read before writing anything: all reading, validation
+        # and alignment happens here, so a failure never produces partial
+        # output or touches the output file.
+        reads_records: Iterable[SequenceRecord] = read_sequences(
+            reads_stream, format=args.reads_format
+        )
+        try:
+            results = list(
+                map_reads(
+                    reference_records,
+                    reads_records,
+                    min_score=args.min_score,
+                    match_score=args.match,
+                    mismatch_penalty=args.mismatch,
+                    gap_open=args.gap_open,
+                    gap_extend=args.gap_extend,
+                )
+            )
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        text = "".join(_mapping_to_json(result) + "\n" for result in results)
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".map-reads-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_ref:
+            ref_stream.close()
+        if close_reads:
+            reads_stream.close()
 
     return 0
 

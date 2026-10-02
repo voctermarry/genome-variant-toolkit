@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对以及参考序列感知的 VCF 规范化功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考序列的读段映射以及参考序列感知的 VCF 规范化功能。
 
 ## 环境与安装
 
@@ -103,6 +103,25 @@ genome-variant-toolkit align-pair REFERENCE QUERY \
 - 输出到文件时仅在全部校验与比对成功后经同目录临时文件原子替换；失败保留已有内容且无部分结果。相同输入与参数产生逐字节相同的输出。
 - 返回码：成功 `0`；参数错误、空输入、多条记录、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
 
+### map-reads
+
+将多条读段映射到多记录参考序列上，按读段输入顺序输出 JSON Lines；FASTQ 质量值不参与打分：
+
+```bash
+genome-variant-toolkit map-reads REFERENCE READS \
+    [--reads-format fasta|fastq|auto] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
+    [--output OUTPUT]
+```
+
+- `REFERENCE` 为 FASTA（可含多条记录），`READS` 为 FASTA 或 FASTQ（默认自动识别）；两者与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但两个输入不能同时为标准输入。
+- 计分沿用 `align-pair` 的局部比对参数：`--match`（别名 `--match-score`，默认 2）为正整数匹配分，`--mismatch`（别名 `--mismatch-penalty`，默认 3）、`--gap-open`（默认 5）、`--gap-extend`（默认 2）为非负整数罚分；`--min-score`（默认 1）为候选的最低分，只接受非布尔正整数。
+- 每条读段分别以正向序列和完整 IUPAC 反向互补序列与每条参考记录做局部比对，只保留分数不低于 `--min-score` 的候选；候选按分数从高到低选择，同分时依次取参考输入序号、`reference_start`、`reference_end`、正链优先、换算到原读段后的 `query_start`、`query_end` 和 CIGAR 字典序较小者。负链的查询坐标换算成原读段上的零基半开区间，CIGAR 仍按参考与反向互补读段的方向解释；重复标识不合并；无达标候选的读段仍输出未映射记录。
+- 每条读段输出一行紧凑 JSON，字段固定为 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考记录序号）、`reference`、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；未映射记录仅保留 `record`、`id` 和 `mapped=false`，其余字段为 `null`。坐标零基、右端不含；输出统一使用 `\n`，末尾恰有一个换行符。
+- 输出到文件时仅在全部记录成功后经同目录临时文件原子替换；失败保留已有内容且无部分结果。相同输入与参数无论如何分批都产生逐字节相同的输出。
+- 返回码：成功 `0`；参数错误、空输入、空参考集合、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
+
 ### normalize-vcf
 
 读取 VCF 并结合必需的参考 FASTA 进行参考序列感知的规范化（等位基因最简化与左对齐）：
@@ -143,6 +162,11 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `PairwiseAlignment`：不可变结果对象，字段依次为 `reference`、`query`（记录标识）、`mode`、`score`、`reference_start`、`reference_end`、`query_start`、`query_end`、`cigar`、`aligned_reference`、`aligned_query`；坐标零基、右端不含，对齐串等长且以 `-` 表示缺口。
 - `align_pair(reference, query, mode="global", match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2)`：比对两个 `SequenceRecord`。`mode` 为 `global`（覆盖两条完整序列）或 `local`（只取正分最佳片段；无正分片段时返回 0 分、四个坐标均为 0、空 CIGAR 与空对齐串）。长度为 `L` 的连续缺口扣 `gap_open + gap_extend × (L-1)`；仅完全相同字符算匹配，其他 IUPAC 组合均算错配；质量值不参与打分。同分时依次选择四个坐标较小者，仍相同则选择 CIGAR 字典序较小者。`match_score` 必须为非布尔正整数，三个罚分必须为非布尔非负整数，`mode` 非法时在处理记录前抛出 `ValueError`；非法碱基抛出 `SequenceValidationError`。
 
+模块 `genome_variant.mapping` 提供：
+
+- `ReadMapping`：不可变结果对象，字段依次为 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考记录序号）、`reference`、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；坐标零基、右端不含，未映射记录 `mapped` 之后全部为 `None`。
+- `map_reads(references, reads, min_score=1, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2)`：惰性地将每条读段映射到多记录参考上，按读段输入顺序为每条读段产生一个 `ReadMapping`。每条读段分别以正向序列和完整 IUPAC 反向互补序列与每条参考记录做局部比对（计分参数同 `align_pair`，质量值不参与），只保留分数不低于 `min_score` 的候选；候选按分数从高到低选择，同分时依次取参考输入序号、`reference_start`、`reference_end`、正链优先、换算到原读段后的 `query_start`、`query_end` 和 CIGAR 字典序较小者。负链结果的查询坐标换算成原读段上的零基半开区间，CIGAR 仍按参考与反向互补读段的方向解释；重复标识不合并；无达标候选的读段仍产生未映射结果。`min_score` 必须为非布尔正整数，计分参数规则同 `align_pair`，非法参数在消费 `reads` 前抛出 `ValueError`；空参考集合抛出 `MappingReferenceError`；非法碱基抛出 `SequenceValidationError`。相同输入无论如何分批都产生相同结果。
+
 模块 `genome_variant.vcf` 提供：
 
 - `VcfHeader(meta_lines=(), samples=())`：`meta_lines` 为按输入顺序保留的 `##` 元信息行（不含行终止符），`samples` 为 `#CHROM` 列头声明的样本名元组；属性 `column_names` 给出完整列头。
@@ -161,6 +185,7 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
+- `MappingReferenceError`（`ValueError` 子类，位于 `genome_variant.mapping`）：传给 `map_reads` 的参考集合为空。
 - 打开路径失败保留 `OSError`，迭代期间的其他异常不会被吞掉。
 
 ## 限制
