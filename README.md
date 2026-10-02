@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV 变异调用以及参考序列感知的 VCF 规范化功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV 变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
 
 ## 环境与安装
 
@@ -162,6 +162,24 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - 成功输出使用制表符与 `\n`，末尾恰有一个换行；无记录的 VCF 仍写出完整头部。写文件时先完成全部记录的读取与校验，再经同目录临时文件原子替换，失败保留原文件。相同输入与参考产生逐字节一致的结果。
 - 返回码：成功 `0`；参数或格式错误、`VcfFormatError`、`ReferenceMismatchError` 以及参考 FASTA 的序列格式错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### annotate-vcf
+
+读取现有 VCF、参考 FASTA 与 GFF3 注释特征，在 INFO 列追加 `GVANN` 注释后输出 VCF：
+
+```bash
+genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATURES \
+    [--output OUTPUT]
+```
+
+- `INPUT`、`--reference`、`--features` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但三个输入至多一个来自标准输入；参考按 FASTA 解析，特征按 GFF3 解析。
+- 仅以 GFF3 的 `CDS` 特征为注释范围；同一 `Parent` 的多个 CDS 片段按坐标与链组合为一条转录本，片段顺序与 GFF3 行序无关。转录本命中按 `Parent` 字典序排列。
+- 依据链与每段 `phase` 建立阅读框：正链按坐标升序读取，负链反向读取并对密码子取反向互补；某片段声明的 `phase` 必须与已拼装的阅读框一致，否则为格式错误。
+- 仅判定 `A`、`C`、`G`、`T` 单碱基替换，后果限定为 `START_LOST`、`STOP_GAINED`、`STOP_LOST`、`SYNONYMOUS`、`MISSENSE`，影响依次为 `HIGH`、`HIGH`、`HIGH`、`LOW`、`MODERATE`（使用标准遗传密码，起始密码子按 `ATG`/甲硫氨酸判定，终止密码子记为 `*`）。未命中任何 CDS 的 SNV 输出 `NON_CODING`/`MODIFIER`；非 SNV、歧义（IUPAC 兼并码）或符号/缺失等位基因输出 `UNSUPPORTED`/`MODIFIER`，原记录一律保留。
+- 元信息末尾追加唯一的 `##INFO=<ID=GVANN,...>` 定义；INFO 项目格式为 `ALT|CONSEQUENCE|IMPACT|TRANSCRIPT|CDS_POS|CODON_CHANGE|AA_CHANGE`，同一 ALT 命中多条转录本时以逗号分隔，多个 ALT 各自产生一项并保持 ALT 次序；`CDS_POS` 为编码序列一基坐标，密码子按编码链给出（如 `ATG>ACG`），氨基酸用单字母（终止为 `*`，如 `K>*`）；无命中时转录本与后续字段为 `.`。INFO 原本缺失（`.`）时以 `GVANN` 开始，否则追加到末尾。
+- 记录顺序、ALT 顺序、样本列与既有字段保持不变；注释前先校验每条记录的 REF。CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、同一 `Parent` 的片段跨序列或阅读框矛盾、CDS 越过序列末端均抛出 `AnnotationFormatError`（消息含来源与一基行号）；VCF 已声明或已使用 `GVANN` 同样抛出该异常。参考中缺少或重复 CHROM、REF 不匹配为 `ReferenceMismatchError`，记录越界为 `VcfFormatError`。
+- 成功输出使用制表符与 `\n`，末尾恰有一个换行；无记录的 VCF 仍写出含 `GVANN` 定义的完整头部。写文件时先完成全部读取、校验与注释，再经同目录临时文件原子替换，失败保留原文件。相同输入跨批次逐字节一致。
+- 返回码：成功 `0`；参数或数据错误（`AnnotationFormatError`、`VcfFormatError`、`ReferenceMismatchError`、参考 FASTA 序列错误）均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -204,6 +222,11 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `normalize_record(record, reference)` 与 `normalize_vcf(document, reference)`：`reference` 为 CHROM 到参考序列的映射或 `SequenceRecord` 可迭代对象。先校验 POS 处 REF；再将全部序列型等位基因作为整体移除共同最长后缀与前缀（每等位至少留一个碱基，POS 随前缀调整），长度不同时左移到表示相同单倍型的最小 POS，每次移动后重新最简化。特殊 ALT 记录仅校验 REF，不剪裁不左移；ALT 次序及 ID、QUAL、FILTER、INFO、FORMAT、样本文本与记录顺序不变。
 - `render_vcf(document)` 与 `write_vcf(document, output)`：使用制表符与 `\n` 序列化，末尾恰有一个换行；无记录时仍写出完整头部。`write_vcf` 接受文本路径或文本流。
 
+模块 `genome_variant.annotation` 提供：
+
+- `AnnotationFormatError`（`ValueError` 子类）：GFF3 的 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、同一 `Parent` 的片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN` 时抛出；消息含来源名与一基行号。
+- `annotate_vcf(document, reference, features)`：`document` 为 `VcfFile`，`reference` 为 CHROM 到序列的映射或 `SequenceRecord` 可迭代对象，`features` 为 GFF3 文本路径或文本流。以 GFF3 的 CDS 为注释范围，按 `Parent` 组合转录本片段、依据链与 `phase` 建立阅读框，用标准遗传密码判定 `A/C/G/T` 单碱基替换。每个 ALT 依次注释，多转录本命中按 `Parent` 字典序；后果为 `START_LOST`、`STOP_GAINED`、`STOP_LOST`（均 `HIGH`）、`SYNONYMOUS`（`LOW`）、`MISSENSE`（`MODERATE`），未命中 CDS 的 SNV 为 `NON_CODING`/`MODIFIER`，非 SNV、歧义或符号等位基因为 `UNSUPPORTED`/`MODIFIER`。返回追加唯一 `##INFO=<ID=GVANN,...>` 定义、并在每条记录 INFO 末尾（INFO 缺失时以其开始）追加 `GVANN=ALT|CONSEQUENCE|IMPACT|TRANSCRIPT|CDS_POS|CODON_CHANGE|AA_CHANGE` 的新 `VcfFile`；记录顺序、ALT 次序、样本列与既有字段不变。参考缺少/重复 CHROM 或 REF 不匹配抛 `ReferenceMismatchError`，记录越界抛 `VcfFormatError`。
+
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 
 异常：
@@ -211,6 +234,7 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 - `SequenceFormatError`：空输入、无法判定格式、空标识、空序列、标题前出现内容、FASTQ 结构不完整或长度不等；消息包含来源名与一基行号。
 - `VcfFormatError`（位于 `genome_variant.vcf`）：缺少或重复 `#CHROM` 列头、列头不合法、固定列/FORMAT/样本列数与列头不符、非正整数 POS、空或非法 REF/ALT、以及规范化时记录越界；消息包含来源与一基行号。
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
+- `AnnotationFormatError`（位于 `genome_variant.annotation`）：GFF3 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN`；消息包含来源与一基行号。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
 - `VariantCallingError`（`ValueError` 子类，位于 `genome_variant.calling`）：变异调用时参考集合为空、参考标识重复或样本名非法。
@@ -218,5 +242,5 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 
 ## 限制
 
-- 仅支持文本 FASTA/FASTQ 与 IUPAC DNA 符号；VCF 支持记录读取、参考校验与序列型等位基因的最简化及左对齐，尚不支持变异注释等后续流程。
+- 仅支持文本 FASTA/FASTQ 与 IUPAC DNA 符号；VCF 支持记录读取、参考校验、序列型等位基因的最简化及左对齐，以及基于 GFF3 CDS 的单碱基替换注释（标准遗传密码），尚不支持插入/缺失与非标准遗传密码等后续注释流程。
 - 变异调用目前仅支持单样本的 `A`、`C`、`G`、`T` 单碱基替换，不调用插入、缺失、多等位位点或歧义碱基；映射计分参数固定为 `map-reads` 的默认值。

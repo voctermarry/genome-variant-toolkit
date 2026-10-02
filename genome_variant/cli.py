@@ -12,6 +12,7 @@ from collections.abc import Iterable, Iterator, Sequence
 
 from . import __version__
 from .alignment import PairwiseAlignment, align_pair
+from .annotation import AnnotationFormatError, annotate_vcf
 from .calling import VariantCallingError, call_variants
 from .kmer import build_kmer_index
 from .mapping import MappingReferenceError, map_reads
@@ -294,6 +295,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="output file, or '-' for standard output (default: standard output)",
     )
 
+    annotate_vcf_cmd = sub.add_parser(
+        "annotate-vcf",
+        help="annotate VCF SNVs against a reference FASTA and GFF3 features",
+    )
+    annotate_vcf_cmd.add_argument(
+        "input", help="VCF input file, or '-' for standard input"
+    )
+    annotate_vcf_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file (required); '-' denotes standard input",
+    )
+    annotate_vcf_cmd.add_argument(
+        "--features",
+        required=True,
+        help="GFF3 feature file (required); '-' denotes standard input",
+    )
+    annotate_vcf_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
+
     map_reads_cmd = sub.add_parser(
         "map-reads",
         help="map FASTA/FASTQ reads against a multi-record FASTA reference",
@@ -442,6 +466,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "normalize-vcf":
         return _run_normalize_vcf(args, parser)
+
+    if args.command == "annotate-vcf":
+        return _run_annotate_vcf(args, parser)
 
     if args.command == "map-reads":
         return _run_map_reads(args, parser)
@@ -948,6 +975,122 @@ def _run_normalize_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser
             vcf_stream.close()
         if close_ref:
             ref_stream.close()
+
+    return 0
+
+
+def _run_annotate_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    stdin_inputs = [
+        name
+        for name, value in (
+            ("input", args.input),
+            ("reference", args.reference),
+            ("features", args.features),
+        )
+        if value == "-"
+    ]
+    if len(stdin_inputs) > 1:
+        print(
+            f"{parser.prog}: at most one of input, --reference and --features "
+            "can be read from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    vcf_stream, close_vcf, code = _open_input(args.input, parser)
+    if vcf_stream is None:
+        return code
+    ref_stream, close_ref, ref_code = _open_input(args.reference, parser)
+    if ref_stream is None:
+        if close_vcf:
+            vcf_stream.close()
+        return ref_code
+    feat_stream, close_feat, feat_code = _open_input(args.features, parser)
+    if feat_stream is None:
+        if close_vcf:
+            vcf_stream.close()
+        if close_ref:
+            ref_stream.close()
+        return feat_code
+
+    try:
+        # Parse and validate every input completely before touching the
+        # output, so a failure never creates partial output or replaces an
+        # existing target.
+        try:
+            document = read_vcf(vcf_stream)
+        except VcfFormatError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            reference_records = list(read_sequences(ref_stream, format="fasta"))
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            annotated = annotate_vcf(document, reference_records, feat_stream)
+        except (
+            AnnotationFormatError,
+            VcfFormatError,
+            ReferenceMismatchError,
+        ) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: features: {exc}", file=sys.stderr)
+            return 1
+
+        text = render_vcf(annotated)
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".annotate-vcf-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_vcf:
+            vcf_stream.close()
+        if close_ref:
+            ref_stream.close()
+        if close_feat:
+            feat_stream.close()
 
     return 0
 
