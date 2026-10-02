@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对以及参考序列感知的 VCF 规范化功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射以及参考序列感知的 VCF 规范化功能。
 
 ## 环境与安装
 
@@ -103,6 +103,25 @@ genome-variant-toolkit align-pair REFERENCE QUERY \
 - 输出到文件时仅在全部校验与比对成功后经同目录临时文件原子替换；失败保留已有内容且无部分结果。相同输入与参数产生逐字节相同的输出。
 - 返回码：成功 `0`；参数错误、空输入、多条记录、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
 
+### map-reads
+
+把多条 FASTA/FASTQ 读段确定性地映射到多记录 FASTA 参考上，按读段输入顺序输出 JSON Lines，每条一行；FASTQ 质量值不参与打分：
+
+```bash
+genome-variant-toolkit map-reads REFERENCE READS \
+    [--reads-format fasta|fastq|auto] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
+    [--output OUTPUT]
+```
+
+- `REFERENCE` 按 FASTA 解析，可含多条参考记录；`READS` 为 FASTA 或 FASTQ，默认自动识别（可用 `--reads-format` 指定）。两者与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但两个输入不能同时为标准输入。
+- 每条读段分别以原序列（正链）与完整 IUPAC 反向互补序列（负链），与每条参考记录做局部比对，计分参数与 `align-pair` 的局部比对一致（默认 `--match 2`、`--mismatch 3`、`--gap-open 5`、`--gap-extend 2`）；`--min-score` 为默认值 1 的非布尔正整数，只保留分数不低于该值的候选。
+- 候选先按分数从高到低选择；同分时依次取参考输入序号、`reference_start`、`reference_end`、正链优先、换算回原读段后的 `query_start`、`query_end`、CIGAR 字典序较小者。负链的查询坐标为换算到原读段后的零基半开区间，CIGAR 仍按参考与反向互补读段的方向解释；重复标识不合并。
+- 无达标候选的读段仍输出一条未映射记录。每行固定按顺序包含 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考序号）、`reference`、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；未映射记录仅 `record`、`id` 与 `mapped:false` 有值，其余字段均为 `null`。
+- 输出统一使用 `\n`，非空结果末尾恰有一个换行符（每条读段恰好对应一行，故成功输出不会为空）；写文件时仅在全部读段成功处理后经同目录临时文件原子替换，任一读取、校验或处理失败都保留已有目标且不留部分结果。相同输入与参数无论如何分批都产生逐字节相同的结果。
+- 返回码：成功 `0`；参数错误、空参考/空读段输入、两边同时使用标准输入、格式或序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
+
 ### normalize-vcf
 
 读取 VCF 并结合必需的参考 FASTA 进行参考序列感知的规范化（等位基因最简化与左对齐）：
@@ -142,6 +161,12 @@ genome-variant-toolkit normalize-vcf INPUT --reference REFERENCE \
 
 - `PairwiseAlignment`：不可变结果对象，字段依次为 `reference`、`query`（记录标识）、`mode`、`score`、`reference_start`、`reference_end`、`query_start`、`query_end`、`cigar`、`aligned_reference`、`aligned_query`；坐标零基、右端不含，对齐串等长且以 `-` 表示缺口。
 - `align_pair(reference, query, mode="global", match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2)`：比对两个 `SequenceRecord`。`mode` 为 `global`（覆盖两条完整序列）或 `local`（只取正分最佳片段；无正分片段时返回 0 分、四个坐标均为 0、空 CIGAR 与空对齐串）。长度为 `L` 的连续缺口扣 `gap_open + gap_extend × (L-1)`；仅完全相同字符算匹配，其他 IUPAC 组合均算错配；质量值不参与打分。同分时依次选择四个坐标较小者，仍相同则选择 CIGAR 字典序较小者。`match_score` 必须为非布尔正整数，三个罚分必须为非布尔非负整数，`mode` 非法时在处理记录前抛出 `ValueError`；非法碱基抛出 `SequenceValidationError`。
+
+模块 `genome_variant.mapping` 提供：
+
+- `MappingReferenceError`（`ValueError` 子类）：参考记录集合为空时抛出。
+- `ReadMapping`：不可变结果对象，字段依次为 `record`（零基读段序号）、`id`、`mapped`、`reference_record`（零基参考输入序号）、`reference`（参考标识）、`reference_start`、`reference_end`、`query_start`、`query_end`、`strand`（`+` 或 `-`）、`score`、`cigar`；坐标零基、右端不含；未映射时除 `record`、`id`、`mapped` 外其余字段均为 `None`。
+- `map_reads(references, reads, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：把读段惰性映射到多条参考，按读段输入顺序产生 `ReadMapping`。每条读段分别以原序列与完整 IUPAC 反向互补序列与每条参考做局部比对（计分语义同 `align_pair` 的 `local`），仅保留分数不低于 `min_score` 的候选；同分依次按参考输入序号、`reference_start`、`reference_end`、正链优先、原读段上的 `query_start`、`query_end`、CIGAR 字典序裁决。负链查询坐标换算回原读段，CIGAR 仍按参考与反向互补读段解释；无达标候选时仍产生未映射结果，重复标识不合并。`min_score` 必须为非布尔正整数，计分参数约束同 `align_pair`，非法参数在消费任一输入前抛出 `ValueError`；参考集合为空在消费 `reads` 前抛出 `MappingReferenceError`；非法碱基在迭代到该记录时抛出 `SequenceValidationError`。
 
 模块 `genome_variant.vcf` 提供：
 
