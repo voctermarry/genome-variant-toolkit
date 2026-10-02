@@ -181,8 +181,7 @@ def map_reads(
     return _iter()
 
 
-def _map_one(
-    record_index: int,
+def _best_candidate(
     read: SequenceRecord,
     references: list[SequenceRecord],
     match: int,
@@ -190,7 +189,16 @@ def _map_one(
     gap_open: int,
     gap_extend: int,
     min_score: int,
-) -> ReadMapping:
+):
+    """Return the winning mapping candidate for *read*, or ``None``.
+
+    The result is ``(reference_index, alignment, strand)`` where the
+    alignment on a reverse-strand win is oriented against the read's
+    reverse complement.  Candidates are scored and tie-broken exactly as
+    in :func:`map_reads`: highest score, then reference input index,
+    reference start/end, the forward strand, the original-read query
+    interval and the lexicographically smallest CIGAR.
+    """
     reverse_record = SequenceRecord(
         read.identifier,
         _reverse_complement(read.sequence),
@@ -247,9 +255,41 @@ def _map_one(
                 best_strand = strand
 
     if best_alignment is None or best_key is None:
+        return None
+    return best_key[1], best_alignment, best_strand
+
+
+def _map_one(
+    record_index: int,
+    read: SequenceRecord,
+    references: list[SequenceRecord],
+    match: int,
+    mismatch: int,
+    gap_open: int,
+    gap_extend: int,
+    min_score: int,
+) -> ReadMapping:
+    winner = _best_candidate(
+        read,
+        references,
+        match,
+        mismatch,
+        gap_open,
+        gap_extend,
+        min_score,
+    )
+    if winner is None:
         return _unmapped(record_index, read)
 
-    ref_index = best_key[1]
+    ref_index, best_alignment, best_strand = winner
+    read_length = len(read.sequence)
+    if best_strand == "+":
+        query_start = best_alignment.query_start
+        query_end = best_alignment.query_end
+    else:
+        query_start = read_length - best_alignment.query_end
+        query_end = read_length - best_alignment.query_start
+
     return ReadMapping(
         record=record_index,
         id=read.identifier,
@@ -258,8 +298,8 @@ def _map_one(
         reference=references[ref_index].identifier,
         reference_start=best_alignment.reference_start,
         reference_end=best_alignment.reference_end,
-        query_start=best_key[5],
-        query_end=best_key[6],
+        query_start=query_start,
+        query_end=query_end,
         strand=best_strand,
         score=best_alignment.score,
         cigar=best_alignment.cigar,
