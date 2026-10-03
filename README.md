@@ -238,6 +238,25 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - 写文件时先完成清单、全部 VCF 与参考的读取校验及合并，再经同目录临时文件原子替换；任一失败都保留已有目标且不产生部分标准输出。相同输入跨运行逐字节一致。
 - 返回码：成功 `0`；清单 JSON/字段/样本唯一性错误、VCF 结构或基因型字段不合规（消息含清单行号或 VCF 来源与一基行号）、`VcfFormatError`、`ReferenceMismatchError`、参考 FASTA 错误均为 `2`（标准错误单行、标准输出为空）；文件读写失败 `1`。
 
+### batch-call-variants
+
+读取 JSON Lines 清单中列出的多个样本的 FASTQ 读段，按 `call-variants` 的语义逐样本独立调用，再按 `summarize-variants` 的参考规范化规则直接合并（不产生中间 VCF），输出逐变异 JSON Lines：
+
+```bash
+genome-variant-toolkit batch-call-variants MANIFEST --reference REFERENCE \
+    [--min-base-quality N] [--min-alt-count N] \
+    [--min-alt-fraction F] [--homozygous-fraction F] \
+    [--call-indels] [--max-indel-length N] \
+    [--output OUTPUT]
+```
+
+- 清单每个非空行为一个 JSON 对象，且仅含字符串字段 `sample` 与 `reads`；`sample` 非空、非纯空白、不含制表符且在清单内全局唯一，`reads` 指向 FASTQ 文件且不得为 `-`。空行忽略。文件清单中的相对 `reads` 路径按清单文件所在目录解析，标准输入清单中的相对路径按当前工作目录解析；绝对路径原样使用。
+- `MANIFEST`、`--reference` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但清单与参考不能同时使用标准输入；参考按 FASTA 解析（标识不得重复，集合不得为空）。
+- 每个清单项按原顺序读取读段，以 `sample` 为样本名，按 `call-variants` 的质量门槛、等位计数、等位比例、基因型及可选短插入缺失语义独立调用；`--min-base-quality`、`--min-alt-count`、`--min-alt-fraction`、`--homozygous-fraction`、`--call-indels` 与 `--max-indel-length` 的默认值、约束与结果均与逐样本调用一致。
+- 各样本结果按 `summarize-variants` 的参考规范化规则合并：输出字段、统计口径、排序与 `summarize-variants` 完全相同，`samples` 保持清单次序；清单为空或无任何变异时输出为空。成功结果为 UTF-8 紧凑 JSON，非 ASCII 原样保留，统一使用 `\n`，非空输出末尾恰有一个换行符。
+- 写文件时先完成清单、全部 FASTQ 与参考的读取校验、所有样本的调用及合并，再经同目录临时文件原子替换；任一失败都保留已有目标且不留临时结果。相同参考、清单、读段与参数跨运行逐字节一致。
+- 返回码：成功 `0`；参数错误、清单 JSON/字段/样本名/样本唯一性错误（消息含清单来源与一基行号）、FASTQ 格式/碱基/质量错误、空参考或重复参考标识均为 `2`（标准错误单行、标准输出为空）；文件读写失败 `1`。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -303,6 +322,13 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `summarize_variants(manifest, reference)`：`manifest` 为清单路径/流或 `ManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。逐个读取、校验并以参考规范化每个单样本 VCF，按规范化后的 `CHROM`/`POS`/`REF`/`ALT` 跨样本合并等价调用；返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序。参考问题抛 `ReferenceMismatchError`/`VcfFormatError`，文件访问失败抛 `OSError`。
 - `render_summaries(summaries)`：序列化为紧凑 UTF-8 JSON Lines（非 ASCII 原样、`\n` 换行），非空结果末尾恰有一个换行，空结果为空字符串。
 
+模块 `genome_variant.batch` 提供：
+
+- `BatchManifestError`（`ValueError` 子类）：清单非合法 JSON、行不是对象、字段缺失/多余/类型非法、`sample` 为空/纯空白/含制表符、样本名重复或 `reads` 为 `-` 时抛出；消息含清单来源与一基行号。
+- `BatchManifestEntry(line_number, sample, reads)`：一条清单项，含一基清单行号、唯一样本名与已解析的 FASTQ 路径。
+- `read_batch_manifest(source)`：接受清单文本路径或文本流，忽略空行，返回按清单次序的 `BatchManifestEntry` 元组；文件清单的相对 `reads` 按其目录解析，流清单按当前工作目录解析。
+- `batch_call_variants(manifest, reference, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, call_indels=False, max_indel_length=50)`：`manifest` 为清单路径/流或 `BatchManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。每个清单项按原顺序读取 FASTQ 并以 `sample` 为样本名按 `call_variants` 的语义独立调用（阈值参数的默认值、约束与校验时机相同），各样本结果按 `summarize_variants` 的参考规范化规则直接合并，不产生中间 VCF；返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序，无变异时为空元组。清单问题抛 `BatchManifestError`，空参考或重复参考标识抛 `VariantCallingError`，FASTQ 格式/碱基/质量问题抛对应的现有异常，文件访问失败抛 `OSError`。
+
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 
 异常：
@@ -312,6 +338,7 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
 - `AnnotationFormatError`（位于 `genome_variant.annotation`）：GFF3 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN`；消息包含来源与一基行号。
 - `ManifestError`（位于 `genome_variant.summary`）：清单结构/字段/样本唯一性错误，或样本 VCF 结构与基因型字段不合规、同一 VCF 规范化后键重复；消息含清单文件与行号，或 VCF 来源与一基行号。
+- `BatchManifestError`（位于 `genome_variant.batch`）：批量调用清单的结构/字段/样本名/样本唯一性错误，或 `reads` 为 `-`；消息含清单来源与一基行号。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
 - `VariantCallingError`（`ValueError` 子类，位于 `genome_variant.calling`）：变异调用时参考集合为空、参考标识重复或样本名非法。

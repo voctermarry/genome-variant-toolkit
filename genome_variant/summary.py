@@ -28,11 +28,12 @@ from __future__ import annotations
 import io
 import json
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
 from .sequence_io import SequenceRecord, read_sequences
 from .vcf import (
+    VcfFile,
     VcfFormatError,
     VcfRecord,
     _is_plain_allele,
@@ -335,6 +336,43 @@ def summarize_variants(
     else:
         reference_records = tuple(reference)
 
+    def _documents() -> Iterator[tuple[str, str, VcfFile]]:
+        for entry in entries:
+            source_label = entry.vcf
+            try:
+                document = read_vcf(entry.vcf)
+            except VcfFormatError as exc:
+                raise ManifestError(str(exc)) from None
+
+            # Single sample, named exactly as the manifest entry.
+            samples = document.header.samples
+            if len(samples) != 1:
+                raise ManifestError(
+                    f"{source_label}:1: VCF must declare exactly one sample, "
+                    f"got {len(samples)}"
+                )
+            if samples[0] != entry.sample:
+                raise ManifestError(
+                    f"{source_label}:1: sample {samples[0]!r} does not match "
+                    f"manifest sample {entry.sample!r}"
+                )
+            yield entry.sample, source_label, document
+
+    return _merge_sample_documents(_documents(), reference_records)
+
+
+def _merge_sample_documents(
+    sample_documents: Iterable[tuple[str, str, VcfFile]],
+    reference_records: tuple[SequenceRecord, ...],
+) -> tuple[VariantSummary, ...]:
+    """Merge validated single-sample VCF documents into summaries.
+
+    *sample_documents* yields ``(sample, source_label, document)`` triples
+    in manifest order; *source_label* is only used in error messages.  Each
+    document is validated, normalized against *reference_records* and
+    merged by normalized ``CHROM``, ``POS``, ``REF`` and ``ALT``; two
+    records in one document normalizing to the same key are a data error.
+    """
     # Reference order for sorting.  Every record's CHROM is checked during
     # normalization, so a later lookup only sees present (and unique) CHROMs.
     order: dict[str, int] = {}
@@ -345,26 +383,7 @@ def summarize_variants(
     calls: dict[tuple[str, int, str, str], list[SampleCall]] = {}
     key_order: list[tuple[str, int, str, str]] = []
 
-    for entry in entries:
-        source_label = entry.vcf
-        try:
-            document = read_vcf(entry.vcf)
-        except VcfFormatError as exc:
-            raise ManifestError(str(exc)) from None
-
-        # Single sample, named exactly as the manifest entry.
-        samples = document.header.samples
-        if len(samples) != 1:
-            raise ManifestError(
-                f"{source_label}:1: VCF must declare exactly one sample, "
-                f"got {len(samples)}"
-            )
-        if samples[0] != entry.sample:
-            raise ManifestError(
-                f"{source_label}:1: sample {samples[0]!r} does not match manifest "
-                f"sample {entry.sample!r}"
-            )
-
+    for sample, source_label, document in sample_documents:
         # Validation first (extract GT/DP/AD per record), then a single
         # reference-aware normalization of the whole document.  Records
         # map one-to-one and keep their order through normalization, so
@@ -387,7 +406,7 @@ def summarize_variants(
             if key not in calls:
                 calls[key] = []
                 key_order.append(key)
-            calls[key].append(SampleCall(entry.sample, gt, dp, ad))
+            calls[key].append(SampleCall(sample, gt, dp, ad))
 
     summaries: list[VariantSummary] = []
     for key in key_order:

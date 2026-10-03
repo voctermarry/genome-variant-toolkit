@@ -13,6 +13,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from . import __version__
 from .alignment import PairwiseAlignment, align_pair
 from .annotation import AnnotationFormatError, annotate_vcf
+from .batch import batch_call_variants
 from .calling import VariantCallingError, call_variants
 from .coverage import coverage_report
 from .deduplication import deduplicate_reads
@@ -482,6 +483,70 @@ def _build_parser() -> argparse.ArgumentParser:
         help="output file, or '-' for standard output (default: standard output)",
     )
 
+    batch_call_cmd = sub.add_parser(
+        "batch-call-variants",
+        help="call variants for many samples listed by a JSON Lines manifest "
+        "and summarize them",
+    )
+    batch_call_cmd.add_argument(
+        "manifest", help="JSON Lines manifest file, or '-' for standard input"
+    )
+    batch_call_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file (required); '-' denotes standard input",
+    )
+    batch_call_cmd.add_argument(
+        "--min-base-quality",
+        type=_quality_int,
+        default=20,
+        metavar="N",
+        help="admit only bases with Phred quality at least N (default: 20)",
+    )
+    batch_call_cmd.add_argument(
+        "--min-alt-count",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="minimum number of ALT observations to call a variant "
+        "(default: 2)",
+    )
+    batch_call_cmd.add_argument(
+        "--min-alt-fraction",
+        type=_fraction,
+        default=0.2,
+        metavar="F",
+        help="minimum ALT fraction AC/DP required to call a variant "
+        "(default: 0.2)",
+    )
+    batch_call_cmd.add_argument(
+        "--homozygous-fraction",
+        type=_fraction,
+        default=0.8,
+        metavar="F",
+        help="ALT fraction at or above which the genotype is 1/1 "
+        "(default: 0.8); must not be below --min-alt-fraction",
+    )
+    batch_call_cmd.add_argument(
+        "--call-indels",
+        action="store_true",
+        help="also call short insertions and deletions from the winning "
+        "alignments (default: SNVs only)",
+    )
+    batch_call_cmd.add_argument(
+        "--max-indel-length",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="longest insertion or deletion to call, a positive integer "
+        "(default: 50); requires --call-indels",
+    )
+    batch_call_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
+
     coverage_report_cmd = sub.add_parser(
         "coverage-report",
         help="report per-reference coverage and concordance from mapped reads",
@@ -601,6 +666,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "call-variants":
         return _run_call_variants(args, parser)
+
+    if args.command == "batch-call-variants":
+        return _run_batch_call_variants(args, parser)
 
     if args.command == "coverage-report":
         return _run_coverage_report(args, parser)
@@ -1553,6 +1621,100 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
             ref_stream.close()
         if close_reads:
             read_stream.close()
+
+    return 0
+
+
+def _run_batch_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.manifest == "-" and args.reference == "-":
+        print(
+            f"{parser.prog}: manifest and reference cannot both be read "
+            "from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.homozygous_fraction < args.min_alt_fraction:
+        print(
+            f"{parser.prog}: --homozygous-fraction must not be smaller than "
+            "--min-alt-fraction",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.max_indel_length is not None and not args.call_indels:
+        print(
+            f"{parser.prog}: --max-indel-length requires --call-indels",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Pass paths through unchanged so a file manifest's relative reads
+    # paths resolve against the manifest's directory; "-" becomes the
+    # standard input stream (relative paths then use the working dir).
+    manifest_source = sys.stdin if args.manifest == "-" else args.manifest
+    reference_source = sys.stdin if args.reference == "-" else args.reference
+
+    # Read and validate the manifest, every FASTQ input and the reference
+    # completely, call every sample and build the full merged result
+    # before touching the output: a failure never produces partial output
+    # or replaces an existing target.
+    try:
+        summaries = batch_call_variants(
+            manifest_source,
+            reference_source,
+            min_base_quality=args.min_base_quality,
+            min_alt_count=args.min_alt_count,
+            min_alt_fraction=args.min_alt_fraction,
+            homozygous_fraction=args.homozygous_fraction,
+            call_indels=args.call_indels,
+            max_indel_length=(
+                50 if args.max_indel_length is None else args.max_indel_length
+            ),
+        )
+    except _READ_ERRORS as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 1
+
+    text = render_summaries(summaries)
+
+    if args.output == "-":
+        # Keep output byte-stable across platforms: no newline
+        # translation on standard output.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(newline="")
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    output_stream, temporary_path = _open_temporary_output(
+        args.output, parser, prefix=".batch-call-variants-"
+    )
+    if output_stream is None:
+        return 1
+    try:
+        try:
+            output_stream.write(text)
+            output_stream.flush()
+            output_stream.close()
+            os.replace(temporary_path, args.output)
+        except OSError as exc:
+            _discard_temporary(output_stream, temporary_path)
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        if not output_stream.closed:
+            try:
+                output_stream.close()
+            except OSError:
+                pass
 
     return 0
 
