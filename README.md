@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV（可选短插入/短缺失）变异调用、参考序列感知的 VCF 规范化、基于 GFF3 CDS 的 VCF 变异注释与影响分级，以及把多样本单样本 VCF 清单汇总为逐变异 JSON Lines 的功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、读段级去重、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV（可选短插入/短缺失）变异调用、参考序列感知的 VCF 规范化、基于 GFF3 CDS 的 VCF 变异注释与影响分级，以及把多样本单样本 VCF 清单汇总为逐变异 JSON Lines 的功能。
 
 ## 环境与安装
 
@@ -64,6 +64,24 @@ genome-variant-toolkit filter-reads INPUT \
 - `INPUT` 与 `--output` 为 `-` 时沿用标准流约定，未指定 `--output` 时写标准输出；记录按输入顺序写出，四行 Phred+33 布局、`\n` 换行、文件末尾恰有一个换行符；全部记录被过滤时输出为空，成功时标准错误为空。
 - 输出到文件时先写同目录临时文件，成功后原子替换；任一读取、校验、处理或写入错误都不会留下部分结果，已有目标内容保持不变。
 - 相同输入与参数产生逐字节相同的输出。
+
+### deduplicate-reads
+
+读取一个 FASTA 或 FASTQ，在映射与变异调用前对读段做确定性去重，每个分组只输出一条代表记录：
+
+```bash
+genome-variant-toolkit deduplicate-reads INPUT \
+    [--input-format fasta|fastq|auto] \
+    [--canonical] \
+    [--output OUTPUT]
+```
+
+- 默认仅把完整大写序列完全相同的记录归为一组；`--canonical` 以序列与其完整 IUPAC 反向互补中字典序较小者为分组键，两种方向互为重复。标识相同但序列不同的记录不合并。
+- FASTA 分组保留最早出现的记录；FASTQ 分组保留 Phred 质量总和最高的记录，分数相同保留最早出现者。代表记录的标识、描述、原始方向、序列与质量值原样保留，不改写成分组键。
+- 结果按各分组首次出现的输入位置排序，记录无论如何分批结果都逐字节一致；输出格式与输入一致（FASTQ 四行布局，FASTA 按默认行宽 60），统一使用 `\n`，非空结果末尾恰有一个换行符。
+- `INPUT` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），输入格式默认自动识别；空文件仍是格式错误。
+- 写文件时先完成全部记录的校验与去重，再经同目录临时文件原子替换；任一失败都保留已有目标且不留部分结果。
+- 返回码：成功 `0`；参数、格式、序列或质量错误 `2`（标准错误单行，标准输出为空）；文件读写错误 `1`。
 
 ### kmer-index
 
@@ -230,6 +248,10 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 模块 `genome_variant.quality` 提供：
 
 - `filter_reads(records, min_end_quality=20, min_mean_quality=20, min_length=30)`：惰性的读段修剪与过滤入口，接收 `SequenceRecord` 迭代器并按输入顺序产生新记录。每条记录先从左右两端连续删除 Phred 分值严格低于末端阈值的碱基（等于阈值保留，内部低质量碱基不切分）；全部碱基被删除、修剪后长度小于最短长度、或质量分总和小于平均质量阈值乘以修剪后长度时丢弃该记录；保留记录的标识与描述不变，序列与质量同步切片。三个阈值只接受非布尔整数，质量阈值限于 0 至 93，最短长度至少为 1，非法值在调用时抛出 `ValueError`；记录错误在迭代到该记录时惰性出现。
+
+模块 `genome_variant.deduplication` 提供：
+
+- `deduplicate_reads(records, canonical=False)`：接收 `SequenceRecord` 可迭代对象，返回按各分组首次出现位置排序的代表记录元组；空迭代器返回空元组。默认以完整大写序列为分组键，`canonical` 为真时以序列与其完整 IUPAC 反向互补中字典序较小者为键（两种方向互为重复）；标识相同但序列不同的记录不合并。无质量值的分组保留最早记录，有质量值的分组保留 Phred 质量总和最高者（并列取最早）；代表记录的标识、描述、方向、序列与质量原样保留。`canonical` 只接受布尔值，非法值在消费 `records` 前抛出 `ValueError`；非法碱基抛出 `SequenceValidationError`；质量缺失、数量不符或越界抛出 `ReadQualityError`；同一输入混有带质量与不带质量的记录抛出 `ValueError`。
 
 模块 `genome_variant.kmer` 提供：
 

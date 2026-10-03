@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from .alignment import PairwiseAlignment, align_pair
 from .annotation import AnnotationFormatError, annotate_vcf
 from .calling import VariantCallingError, call_variants
 from .coverage import coverage_report
+from .deduplication import deduplicate_reads
 from .kmer import build_kmer_index
 from .mapping import MappingReferenceError, map_reads
 from .quality import ReadQualityError, filter_reads
@@ -182,6 +184,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="drop reads shorter than N bases after trimming (default: 30)",
     )
     filter_reads_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
+
+    deduplicate_cmd = sub.add_parser(
+        "deduplicate-reads",
+        help="deduplicate FASTA/FASTQ reads by exact or canonical sequence",
+    )
+    deduplicate_cmd.add_argument(
+        "input", help="input file, or '-' for standard input"
+    )
+    deduplicate_cmd.add_argument(
+        "--input-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="input format (default: auto-detect from the first title line)",
+    )
+    deduplicate_cmd.add_argument(
+        "--canonical",
+        action="store_true",
+        help="also group each sequence with its full IUPAC reverse "
+        "complement (default: only identical sequences are duplicates)",
+    )
+    deduplicate_cmd.add_argument(
         "--output",
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
@@ -557,6 +584,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "filter-reads":
         return _run_filter_reads(args, parser)
 
+    if args.command == "deduplicate-reads":
+        return _run_deduplicate_reads(args, parser)
+
     if args.command == "kmer-index":
         return _run_kmer_index(args, parser)
 
@@ -726,6 +756,88 @@ def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser)
             # by _discard_temporary; on success it was closed explicitly
             # before os.replace. This only closes a still-open temp stream.
             if close_output and not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_input:
+            input_stream.close()
+
+    return 0
+
+
+def _run_deduplicate_reads(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    if args.input == "-":
+        input_stream = sys.stdin
+        close_input = False
+    else:
+        try:
+            input_stream = open(args.input, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        close_input = True
+
+    try:
+        records: Iterable[SequenceRecord] = read_sequences(
+            input_stream, format=args.input_format
+        )
+        # Deduplicate before writing anything: all reading and validation
+        # happens here, so a failure never produces partial output or
+        # touches the output file.
+        try:
+            representatives = deduplicate_reads(records, canonical=args.canonical)
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        # The input is homogeneous (mixed quality/no-quality input was
+        # rejected above), so the first representative fixes the format.
+        output_format = (
+            "fastq"
+            if representatives and representatives[0].quality is not None
+            else "fasta"
+        )
+        buffer = io.StringIO()
+        write_sequences(representatives, buffer, format=output_format)
+        text = buffer.getvalue()
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".deduplicate-reads-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
                 try:
                     output_stream.close()
                 except OSError:
