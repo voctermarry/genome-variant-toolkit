@@ -429,6 +429,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "(default: 0.8); must not be below --min-alt-fraction",
     )
     call_variants_cmd.add_argument(
+        "--call-indels",
+        action="store_true",
+        help="also call short insertions and deletions from the winning "
+        "alignment (default: substitutions only)",
+    )
+    call_variants_cmd.add_argument(
+        "--max-indel-length",
+        type=_positive_int,
+        default=50,
+        metavar="N",
+        help="maximum insertion/deletion length to call when "
+        "--call-indels is set (default: 50)",
+    )
+    call_variants_cmd.add_argument(
         "--sample-name",
         default="SAMPLE",
         help="sample name written to the #CHROM header (default: SAMPLE)",
@@ -1323,6 +1337,8 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
                 min_alt_fraction=args.min_alt_fraction,
                 homozygous_fraction=args.homozygous_fraction,
                 sample_name=args.sample_name,
+                call_indels=args.call_indels,
+                max_indel_length=args.max_indel_length,
             )
             text = render_vcf(document)
         except (

@@ -211,6 +211,192 @@ class TestCallVariants:
         assert "quality" in err
 
 
+# Reference and reads carrying an interior one-base insertion after POS 3.
+INDEL_REFERENCE = ">c1\nACGTACGTAC\n"
+INS_READ_SEQ = "ACGATACGTAC"
+DEL_READ_SEQ = "ACGACGTAC"
+EXPECTED_INSERTION = (
+    "c1\t3\t.\tG\tGA\t.\tPASS\tDP=3;AC=2;AF=0.666667\tGT:DP:AD\t0/1:3:1,2"
+)
+EXPECTED_DELETION = (
+    "c1\t3\t.\tGT\tG\t.\tPASS\tDP=3;AC=2;AF=0.666667\tGT:DP:AD\t0/1:3:1,2"
+)
+
+
+class TestCallIndelsCli:
+    def test_indels_off_by_default(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(
+            tmp_path,
+            "q.fq",
+            fastq("a", INS_READ_SEQ)
+            + fastq("b", INS_READ_SEQ)
+            + fastq("c", "ACGTACGTAC"),
+        )
+        code, out, err = run(["call-variants", str(reference), str(reads)])
+        assert code == 0
+        assert not [line for line in out.splitlines() if not line.startswith("#")]
+
+    def test_insertion_called_with_flag(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(
+            tmp_path,
+            "q.fq",
+            fastq("a", INS_READ_SEQ)
+            + fastq("b", INS_READ_SEQ)
+            + fastq("c", "ACGTACGTAC"),
+        )
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--call-indels"]
+        )
+        assert code == 0
+        assert err == ""
+        assert out.splitlines()[-1] == EXPECTED_INSERTION
+
+    def test_deletion_called_with_flag(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(
+            tmp_path,
+            "q.fq",
+            fastq("a", DEL_READ_SEQ)
+            + fastq("b", DEL_READ_SEQ)
+            + fastq("c", "ACGTACGTAC"),
+        )
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--call-indels"]
+        )
+        assert code == 0
+        assert out.splitlines()[-1] == EXPECTED_DELETION
+
+    def test_max_indel_length_limits_calls(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", ">c1\nACGTACGTAC\n")
+        mutant = "ACGTAGGGCGTAC"  # 3-base insertion
+        reads = write(
+            tmp_path, "q.fq", fastq("a", mutant) + fastq("b", mutant)
+        )
+        code, out, err = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--max-indel-length",
+                "2",
+                "--min-alt-count",
+                "1",
+            ]
+        )
+        assert code == 0
+        assert not [line for line in out.splitlines() if not line.startswith("#")]
+
+        code, out, err = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--max-indel-length",
+                "3",
+            ]
+        )
+        assert code == 0
+        assert "A\tAGGG" in out
+
+    def test_indel_output_round_trips_and_normalizes(self, tmp_path) -> None:
+        from io import StringIO
+
+        from genome_variant.sequence_io import read_sequences
+        from genome_variant.vcf import normalize_vcf, read_vcf, render_vcf
+
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(
+            tmp_path,
+            "q.fq",
+            fastq("a", INS_READ_SEQ)
+            + fastq("b", INS_READ_SEQ)
+            + fastq("c", "ACGTACGTAC"),
+        )
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--call-indels"]
+        )
+        assert code == 0
+        document = read_vcf(StringIO(out))
+        with open(reference, encoding="utf-8") as stream:
+            references = list(read_sequences(stream, format="fasta"))
+        normalized = render_vcf(normalize_vcf(document, references))
+        assert normalized == out
+
+    def test_invalid_max_indel_length_exit_2(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(tmp_path, "q.fq", fastq("a", INS_READ_SEQ))
+        for value in ("0", "-3", "1.5", "x"):
+            code, out, err = run(
+                [
+                    "call-variants",
+                    str(reference),
+                    str(reads),
+                    "--call-indels",
+                    "--max-indel-length",
+                    value,
+                ]
+            )
+            assert code == 2, value
+            assert out == "", value
+            assert err.count("\n") == 1, value
+
+    def test_max_indel_length_without_flag_still_validated(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(tmp_path, "q.fq", fastq("a", INS_READ_SEQ))
+        code, out, err = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--max-indel-length",
+                "0",
+            ]
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+
+    def test_indel_file_output_atomic_and_byte_stable(self, tmp_path) -> None:
+        reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+        reads = write(
+            tmp_path,
+            "q.fq",
+            fastq("a", INS_READ_SEQ)
+            + fastq("b", INS_READ_SEQ)
+            + fastq("c", "ACGTACGTAC"),
+        )
+        first = tmp_path / "a.vcf"
+        second = tmp_path / "b.vcf"
+        code1, _, err1 = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--output",
+                str(first),
+            ]
+        )
+        code2, _, err2 = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--output",
+                str(second),
+            ]
+        )
+        assert code1 == code2 == 0
+        assert err1 == err2 == ""
+        assert first.read_bytes() == second.read_bytes()
+        assert not list(tmp_path.glob("*.tmp"))
+
+
 class TestCallVariantsErrors:
     def test_both_inputs_stdin_rejected(self) -> None:
         code, out, err = run(["call-variants", "-", "-"], REFERENCE)
