@@ -15,6 +15,11 @@ from .alignment import PairwiseAlignment, align_pair
 from .annotation import AnnotationFormatError, annotate_vcf
 from .batch import BatchManifestError, batch_call_variants
 from .calling import VariantCallingError, call_variants
+from .comparison import (
+    VariantComparisonError,
+    compare_variants,
+    render_comparison,
+)
 from .coverage import coverage_report
 from .deduplication import deduplicate_reads
 from .kmer import build_kmer_index
@@ -625,6 +630,28 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    compare_cmd = sub.add_parser(
+        "compare-variants",
+        help="compare the call sets of two single-sample VCFs against a "
+        "reference FASTA",
+    )
+    compare_cmd.add_argument(
+        "baseline", help="baseline VCF file, or '-' for standard input"
+    )
+    compare_cmd.add_argument(
+        "candidate", help="candidate VCF file, or '-' for standard input"
+    )
+    compare_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file (required); '-' denotes standard input",
+    )
+    compare_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -675,6 +702,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "summarize-variants":
         return _run_summarize_variants(args, parser)
+
+    if args.command == "compare-variants":
+        return _run_compare_variants(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -1885,6 +1915,89 @@ def _run_summarize_variants(args: argparse.Namespace, parser: argparse.ArgumentP
 
     output_stream, temporary_path = _open_temporary_output(
         args.output, parser, prefix=".summarize-variants-"
+    )
+    if output_stream is None:
+        return 1
+    try:
+        try:
+            output_stream.write(text)
+            output_stream.flush()
+            output_stream.close()
+            os.replace(temporary_path, args.output)
+        except OSError as exc:
+            _discard_temporary(output_stream, temporary_path)
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        if not output_stream.closed:
+            try:
+                output_stream.close()
+            except OSError:
+                pass
+
+    return 0
+
+
+def _run_compare_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    stdin_inputs = [
+        name
+        for name, value in (
+            ("baseline", args.baseline),
+            ("candidate", args.candidate),
+            ("--reference", args.reference),
+        )
+        if value == "-"
+    ]
+    if len(stdin_inputs) > 1:
+        print(
+            f"{parser.prog}: at most one of baseline, candidate and --reference "
+            "can be read from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Pass paths through unchanged; "-" becomes the standard input stream.
+    baseline_source = sys.stdin if args.baseline == "-" else args.baseline
+    candidate_source = sys.stdin if args.candidate == "-" else args.candidate
+    reference_source = sys.stdin if args.reference == "-" else args.reference
+
+    # Read and validate both VCFs and the reference completely and build
+    # the full comparison before touching the output: a failure never
+    # produces partial output or replaces an existing target.
+    try:
+        comparison = compare_variants(
+            baseline_source, candidate_source, reference_source
+        )
+    except (
+        VariantComparisonError,
+        VcfFormatError,
+        ReferenceMismatchError,
+        SequenceFormatError,
+        SequenceValidationError,
+    ) as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 1
+
+    text = render_comparison(comparison)
+
+    if args.output == "-":
+        # Keep output byte-stable across platforms: no newline
+        # translation on standard output.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(newline="")
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    output_stream, temporary_path = _open_temporary_output(
+        args.output, parser, prefix=".compare-variants-"
     )
     if output_stream is None:
         return 1

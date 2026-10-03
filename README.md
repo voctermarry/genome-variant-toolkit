@@ -260,6 +260,23 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - 写文件时先完成清单、全部 VCF 与参考的读取校验及合并，再经同目录临时文件原子替换；任一失败都保留已有目标且不产生部分标准输出。相同输入跨运行逐字节一致。
 - 返回码：成功 `0`；清单 JSON/字段/样本唯一性错误、VCF 结构或基因型字段不合规（消息含清单行号或 VCF 来源与一基行号）、`VcfFormatError`、`ReferenceMismatchError`、参考 FASTA 错误均为 `2`（标准错误单行、标准输出为空）；文件读写失败 `1`。
 
+### compare-variants
+
+比较基线与候选两个单样本 VCF 的调用集，结合参考 FASTA 规范化后按键对齐，输出单个紧凑 JSON 对象：
+
+```bash
+genome-variant-toolkit compare-variants BASELINE CANDIDATE --reference REFERENCE \
+    [--output OUTPUT]
+```
+
+- `BASELINE`、`CANDIDATE`、`--reference` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但三个输入中至多一个使用标准输入；参考按 FASTA 解析。
+- 每个 VCF 恰有一个样本。每条记录仅接受 FILTER 为 `PASS` 或 `.`、单一普通序列型 ALT（拒绝符号型、断点、`*` 与缺失值 `.`，以及多等位）且 FORMAT 含 `GT`、基因型为 `0/1` 或 `1/1` 的记录（FORMAT 允许额外字段与任意字段次序，但字段不得重复，样本列字段数须与 FORMAT 一致）。
+- 比较前按现有规则做参考校验、最简化与左对齐，以规范化后的 `CHROM`、`POS`、`REF`、`ALT` 为键；输入顺序及等价表示不影响结果，同一 VCF 规范化后键重复视为数据错误。
+- 输出为单行紧凑 JSON 并以换行结束，字段依次为 `baseline_sample`、`candidate_sample`、`total`、`matched`、`genotype_mismatch`、`baseline_only`、`candidate_only`、`concordance`、`differences`。`matched` 表示键与 GT 均相同，`genotype_mismatch` 表示同键不同 GT，两个 `only` 表示仅一侧存在；`total` 为四类计数之和，`concordance` 为 `matched` 除以 `total` 的六位小数字符串，双方均无记录时为 `1.000000`。
+- `differences` 仅含后三类，元素字段依次为 `chrom`、`pos`、`ref`、`alt`、`status`、`baseline_gt`、`candidate_gt`，缺失侧 GT 为 `null`，并按参考记录次序、`POS`、`REF`、`ALT` 排序；相同语义输入产生逐字节一致的输出。
+- 写文件时先完成两个 VCF 与参考的读取校验及比较，再经同目录临时文件原子替换；任一失败都保留已有目标且不产生部分标准输出。
+- 返回码：成功 `0`；VCF 结构错误（`VcfFormatError`）、参考缺少/重复 CHROM 或 REF 不符（`ReferenceMismatchError`）、样本数及 FILTER/ALT/GT 不合约束或键重复（`VariantComparisonError`）、参考 FASTA 错误均为 `2`（标准错误单行、标准输出为空）；文件读写失败 `1`。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -325,6 +342,14 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `summarize_variants(manifest, reference)`：`manifest` 为清单路径/流或 `ManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。逐个读取、校验并以参考规范化每个单样本 VCF，按规范化后的 `CHROM`/`POS`/`REF`/`ALT` 跨样本合并等价调用；返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序。参考问题抛 `ReferenceMismatchError`/`VcfFormatError`，文件访问失败抛 `OSError`。
 - `render_summaries(summaries)`：序列化为紧凑 UTF-8 JSON Lines（非 ASCII 原样、`\n` 换行），非空结果末尾恰有一个换行，空结果为空字符串。
 
+模块 `genome_variant.comparison` 提供：
+
+- `VariantComparisonError`（`ValueError` 子类）：VCF 样本数不为一、记录 FILTER 非 `PASS`/`.`、ALT 非单一普通序列型、FORMAT 缺 `GT`、GT 非 `0/1`/`1/1`，或同一 VCF 规范化后键重复时抛出；消息含 VCF 来源与一基记录行号。
+- `VariantDifference`：一条差异，字段为 `chrom`、`pos`、`ref`、`alt`、`status`（`genotype_mismatch`/`baseline_only`/`candidate_only`）、`baseline_gt`、`candidate_gt`（缺失侧为 `None`）。
+- `VariantComparison`：比较结果，字段为 `baseline_sample`、`candidate_sample`、四类计数 `matched`/`genotype_mismatch`/`baseline_only`/`candidate_only` 与按参考次序、`POS`、`REF`、`ALT` 排序的 `differences` 元组；属性 `total` 为四类计数之和，`concordance` 为 `matched/total` 的六位小数字符串（双方无记录时为 `1.000000`）。
+- `compare_variants(baseline, candidate, reference)`：`baseline`/`candidate` 为 VCF 路径、文本流或已解析的 `VcfFile`，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。读取、校验并以参考规范化两个单样本 VCF，按键 `CHROM`/`POS`/`REF`/`ALT` 对齐比较；结果与输入顺序及等价表示无关。VCF 语法或越界抛 `VcfFormatError`，参考缺少/重复 CHROM 或 REF 不符抛 `ReferenceMismatchError`，样本数及 FILTER/ALT/GT 不合约束或键重复抛 `VariantComparisonError`，文件访问失败抛 `OSError`。
+- `render_comparison(comparison)`：序列化为单个紧凑 UTF-8 JSON 对象（非 ASCII 原样），字段依次为 `baseline_sample`、`candidate_sample`、`total`、`matched`、`genotype_mismatch`、`baseline_only`、`candidate_only`、`concordance`、`differences`，末尾恰有一个 `\n`。
+
 模块 `genome_variant.batch` 提供：
 
 - `BatchManifestError`（`ValueError` 子类）：清单非合法 JSON、行不是对象、字段缺失/多余/类型非法、`sample` 为空、纯空白或含制表符、样本名重复，或 `reads` 为空、非字符串或为 `-` 时抛出；消息含清单来源与一基行号。
@@ -341,6 +366,7 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
 - `AnnotationFormatError`（位于 `genome_variant.annotation`）：GFF3 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN`；消息包含来源与一基行号。
 - `ManifestError`（位于 `genome_variant.summary`）：清单结构/字段/样本唯一性错误，或样本 VCF 结构与基因型字段不合规、同一 VCF 规范化后键重复；消息含清单文件与行号，或 VCF 来源与一基行号。
+- `VariantComparisonError`（位于 `genome_variant.comparison`）：比较输入的 VCF 样本数不为一、FILTER/ALT/GT 不合约束，或同一 VCF 规范化后键重复；消息含 VCF 来源与一基记录行号。
 - `BatchManifestError`（位于 `genome_variant.batch`）：批量清单结构/字段/样本唯一性错误，或 `reads` 为 `-`；消息含清单来源与一基行号。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
