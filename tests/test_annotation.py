@@ -116,15 +116,17 @@ class TestNonCodingAndUnsupported:
         result = annotate_text(text, self.SEQUENCE, self.CDS)
         assert gvann_of(result) == "G|NON_CODING|MODIFIER|.|.|.|."
 
-    def test_insertion_unsupported(self) -> None:
-        text = HEADER + COLUMNS + "chr1\t4\t.\tA\tAT\t.\t.\t.\n"
+    def test_complex_replacement_unsupported(self) -> None:
+        # Reference at positions 3-6 is GAAA; GAAA -> GTT both deletes
+        # bases and substitutes one, so it is not a pure indel.
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tGTT\t.\t.\t.\n"
         result = annotate_text(text, self.SEQUENCE, self.CDS)
-        assert gvann_of(result) == "AT|UNSUPPORTED|MODIFIER|.|.|.|."
+        assert gvann_of(result) == "GTT|UNSUPPORTED|MODIFIER|.|.|.|."
 
-    def test_deletion_unsupported(self) -> None:
-        text = HEADER + COLUMNS + "chr1\t4\t.\tAA\tA\t.\t.\t.\n"
+    def test_same_length_mnv_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t4\t.\tAA\tTT\t.\t.\t.\n"
         result = annotate_text(text, self.SEQUENCE, self.CDS)
-        assert gvann_of(result) == "A|UNSUPPORTED|MODIFIER|.|.|.|."
+        assert gvann_of(result) == "TT|UNSUPPORTED|MODIFIER|.|.|.|."
 
     def test_ambiguous_alt_unsupported(self) -> None:
         text = HEADER + COLUMNS + "chr1\t4\t.\tA\tR\t.\t.\t.\n"
@@ -173,13 +175,13 @@ class TestMultiple:
         assert [item.split("|")[3] for item in items] == ["t_a", "t_b"]
 
     def test_mix_of_coding_and_non_coding_alt(self) -> None:
-        # First ALT is an in-CDS SNV, second is an indel.
+        # First ALT is an in-CDS SNV, second is an ambiguous allele.
         cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
-        text = HEADER + COLUMNS + "chr1\t2\t.\tT\tC,TC\t.\t.\t.\n"
+        text = HEADER + COLUMNS + "chr1\t2\t.\tT\tC,R\t.\t.\t.\n"
         result = annotate_text(text, self.SEQUENCE, cds)
         items = gvann_of(result).split(",")
         assert items[0] == "C|START_LOST|HIGH|t1|2|ATG>ACG|M>T"
-        assert items[1] == "TC|UNSUPPORTED|MODIFIER|.|.|.|."
+        assert items[1] == "R|UNSUPPORTED|MODIFIER|.|.|.|."
 
 
 class TestMinusStrand:
@@ -220,6 +222,293 @@ class TestMinusStrand:
         text = HEADER + COLUMNS + "chr1\t2\t.\tT\tC\t.\t.\t.\n"
         result = annotate_text(text, sequence, cds)
         assert gvann_of(result) == "C|MISSENSE|MODERATE|t1|12|ATA>ATG|I>M"
+
+
+class TestIndelsPlusStrand:
+    """ATG AAA TTT GGG CCC — five codons on chr1, one CDS fragment."""
+
+    SEQUENCE = "ATGAAATTTGGGCCC"
+    CDS = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
+
+    def test_inframe_deletion_three_bases(self) -> None:
+        # Delete coding bases 4-6 (AAA): anchor base 3, right base 7.
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "G|INFRAME_DELETION|MODERATE|t1|4|.|."
+        )
+
+    def test_inframe_deletion_six_bases(self) -> None:
+        # Delete coding bases 4-9, anchor base 3 (G), right base 10 (G).
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAATTT\tG\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "G|INFRAME_DELETION|MODERATE|t1|4|.|."
+        )
+
+    def test_frameshift_deletion_one_base(self) -> None:
+        # POS 4 REF AA ALT A deletes coding base 5.
+        text = HEADER + COLUMNS + "chr1\t4\t.\tAA\tA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "A|FRAMESHIFT|HIGH|t1|5|.|."
+
+    def test_frameshift_deletion_two_bases(self) -> None:
+        # POS 4 REF AAA ALT A deletes coding bases 5 and 6.
+        text = HEADER + COLUMNS + "chr1\t4\t.\tAAA\tA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "A|FRAMESHIFT|HIGH|t1|5|.|."
+
+    def test_inframe_insertion_three_bases(self) -> None:
+        # Insert AAA after coding base 3; CDS_POS is the right base 4.
+        text = HEADER + COLUMNS + "chr1\t3\t.\tG\tGAAA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "GAAA|INFRAME_INSERTION|MODERATE|t1|4|.|."
+        )
+
+    def test_frameshift_insertion_one_base(self) -> None:
+        # Insert T after coding base 6; the right coding base is 7.
+        text = HEADER + COLUMNS + "chr1\t6\t.\tA\tAT\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "AT|FRAMESHIFT|HIGH|t1|7|.|."
+
+    def test_frameshift_insertion_four_bases(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t3\t.\tG\tGACGT\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "GACGT|FRAMESHIFT|HIGH|t1|4|.|."
+
+    def test_insertion_at_cds_end_unsupported(self) -> None:
+        # Anchor is the last coding base 15, the right base 16 is outside.
+        sequence = self.SEQUENCE + "AAA"
+        text = HEADER + COLUMNS + "chr1\t15\t.\tC\tCAAA\t.\t.\t.\n"
+        result = annotate_text(text, sequence, self.CDS)
+        assert gvann_of(result) == (
+            "CAAA|UNSUPPORTED|MODIFIER|t1|15|.|."
+        )
+
+    def test_deletion_running_past_cds_end_unsupported(self) -> None:
+        # Delete coding bases 14-15 plus non-coding base 16.
+        sequence = self.SEQUENCE + "AAA"
+        text = HEADER + COLUMNS + "chr1\t13\t.\tCCCA\tC\t.\t.\t.\n"
+        result = annotate_text(text, sequence, self.CDS)
+        assert gvann_of(result) == "C|UNSUPPORTED|MODIFIER|t1|14|.|."
+
+    def test_insertion_after_cds_is_non_coding(self) -> None:
+        sequence = self.SEQUENCE + "AAA"
+        text = HEADER + COLUMNS + "chr1\t16\t.\tA\tAT\t.\t.\t.\n"
+        result = annotate_text(text, sequence, self.CDS)
+        assert gvann_of(result) == "AT|NON_CODING|MODIFIER|.|.|.|."
+
+    def test_deletion_after_cds_is_non_coding(self) -> None:
+        sequence = self.SEQUENCE + "AAAAA"
+        text = HEADER + COLUMNS + "chr1\t16\t.\tAA\tA\t.\t.\t.\n"
+        result = annotate_text(text, sequence, self.CDS)
+        assert gvann_of(result) == "A|NON_CODING|MODIFIER|.|.|.|."
+
+    def test_deletion_starting_inside_cds_uses_first_deleted_base(self) -> None:
+        # Delete bases 2-4, anchored at coding base 1.
+        text = HEADER + COLUMNS + "chr1\t1\t.\tATGA\tA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "A|INFRAME_DELETION|MODERATE|t1|2|.|."
+
+
+class TestIndelFragments:
+    """Two adjacent CDS fragments 1-9 and 10-15 on the plus strand."""
+
+    SEQUENCE = "ATGAAATTTGGGCCC"
+    CDS = (
+        "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+        "chr1\tx\tCDS\t10\t15\t.\t+\t0\tParent=t1\n"
+    )
+
+    def test_deletion_crossing_fragment_junction_unsupported(self) -> None:
+        # Delete bases 8-10: anchor 7 in fragment one, right base 11 in two.
+        text = HEADER + COLUMNS + "chr1\t7\t.\tTTTG\tT\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "T|UNSUPPORTED|MODIFIER|t1|8|.|."
+
+    def test_insertion_crossing_fragment_junction_unsupported(self) -> None:
+        # Boundary between coding base 9 (fragment one) and 10 (fragment two).
+        text = HEADER + COLUMNS + "chr1\t9\t.\tT\tTAAA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "TAAA|UNSUPPORTED|MODIFIER|t1|10|.|."
+
+    def test_inframe_deletion_within_second_fragment(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t10\t.\tGGGC\tG\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "G|INFRAME_DELETION|MODERATE|t1|11|.|."
+        )
+
+    def test_inframe_insertion_within_second_fragment(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t11\t.\tG\tGAAA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "GAAA|INFRAME_INSERTION|MODERATE|t1|12|.|."
+        )
+
+    def test_deletion_spanning_intron_unsupported(self) -> None:
+        # Fragments 1-9 and 16-18; delete bases 8-16 (mostly intronic).
+        sequence = "ATGAAATTTGGGCCCAAAAA"
+        cds = (
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t16\t18\t.\t+\t0\tParent=t1\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t7\t.\tTTTGGGCCCA\tT\t.\t.\t.\n"
+        result = annotate_text(text, sequence, cds)
+        assert gvann_of(result) == "T|UNSUPPORTED|MODIFIER|t1|8|.|."
+
+    def test_insertion_inside_intron_is_non_coding(self) -> None:
+        sequence = "ATGAAATTTGGGCCCAAAAA"
+        cds = (
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t16\t18\t.\t+\t0\tParent=t1\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t12\t.\tG\tGAAA\t.\t.\t.\n"
+        result = annotate_text(text, sequence, cds)
+        assert gvann_of(result) == "GAAA|NON_CODING|MODIFIER|.|.|.|."
+
+
+class TestIndelsMinusStrand:
+    # Reverse complement of the 9 bases is ATG AAA TAA; genomic base 9 is
+    # coding base 1 and coding order descends with genomic coordinates.
+    SEQUENCE = "TTATTTCAT"
+    CDS = "chr1\tx\tCDS\t1\t9\t.\t-\t0\tParent=t1\n"
+
+    def test_inframe_deletion_three_bases(self) -> None:
+        # Delete genomic bases 4-6 = coding bases 6,5,4; first affected 4.
+        text = HEADER + COLUMNS + "chr1\t3\t.\tATTT\tA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "A|INFRAME_DELETION|MODERATE|t1|4|.|."
+        )
+
+    def test_frameshift_deletion_one_base(self) -> None:
+        # Delete genomic base 6 (coding base 4), anchored at base 7.
+        text = HEADER + COLUMNS + "chr1\t6\t.\tTC\tC\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "C|FRAMESHIFT|HIGH|t1|4|.|."
+
+    def test_inframe_insertion_uses_right_coding_base(self) -> None:
+        # Boundary between genomic bases 7 (coding 3) and 8 (coding 2):
+        # the downstream side in coding (5'->3') direction is coding
+        # position 3, so the insertion reports CDS_POS 3.
+        text = HEADER + COLUMNS + "chr1\t7\t.\tC\tCAAA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == (
+            "CAAA|INFRAME_INSERTION|MODERATE|t1|3|.|."
+        )
+
+    def test_frameshift_insertion_one_base(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t7\t.\tC\tCA\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "CA|FRAMESHIFT|HIGH|t1|3|.|."
+
+    def test_split_minus_cds_inframe_deletion(self) -> None:
+        # Fragments 5-14 (phase 0) and 1-3 (phase 2); delete genomic
+        # bases 10-12 = coding bases 5,4,3, all within fragment 5-14.
+        sequence = "TTATTTCATGGGGG"
+        cds = (
+            "chr1\tx\tCDS\t5\t14\t.\t-\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t1\t3\t.\t-\t2\tParent=t1\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t9\t.\tTGGG\tT\t.\t.\t.\n"
+        result = annotate_text(text, sequence, cds)
+        assert gvann_of(result) == (
+            "T|INFRAME_DELETION|MODERATE|t1|3|.|."
+        )
+
+    def test_split_minus_cds_cross_junction_unsupported(self) -> None:
+        # Delete genomic bases 4-5: base 5 is the last coding base of the
+        # first fragment, base 4 is intronic and the anchors lie in
+        # different fragments.
+        sequence = "TTATTTCATGGGGG"
+        cds = (
+            "chr1\tx\tCDS\t5\t14\t.\t-\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t1\t3\t.\t-\t2\tParent=t1\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t3\t.\tATT\tA\t.\t.\t.\n"
+        result = annotate_text(text, sequence, cds)
+        assert gvann_of(result) == "A|UNSUPPORTED|MODIFIER|t1|10|.|."
+
+
+class TestIndelsMultiple:
+    SEQUENCE = "ATGAAATTTGGGCCC"
+
+    def test_multiple_indel_alts_keep_order(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG,GAAAACGT\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        assert [item.split("|", 1)[0] for item in items] == [
+            "G",
+            "GAAAACGT",
+        ]
+        assert items[0] == "G|INFRAME_DELETION|MODERATE|t1|4|.|."
+        assert items[1] == "GAAAACGT|FRAMESHIFT|HIGH|t1|7|.|."
+
+    def test_multiple_transcripts_lexicographic(self) -> None:
+        cds = (
+            "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t_b\n"
+            "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t_a\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        assert [item.split("|")[3] for item in items] == ["t_a", "t_b"]
+        assert items[0] == "G|INFRAME_DELETION|MODERATE|t_a|4|.|."
+        assert items[1] == "G|INFRAME_DELETION|MODERATE|t_b|4|.|."
+
+    def test_one_transcript_coding_one_unaffected(self) -> None:
+        # t2's CDS starts at base 10, so the deletion at bases 4-6 only
+        # touches t1.
+        cds = (
+            "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t10\t15\t.\t+\t0\tParent=t2\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        assert len(items) == 1
+        assert items[0] == "G|INFRAME_DELETION|MODERATE|t1|4|.|."
+
+    def test_mixed_snv_and_indel_alts(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
+        text = HEADER + COLUMNS + "chr1\t4\t.\tA\tT,AT\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        assert items[0] == "T|STOP_GAINED|HIGH|t1|4|AAA>TAA|K>*"
+        assert items[1] == "AT|FRAMESHIFT|HIGH|t1|5|.|."
+
+
+class TestIndelUnsupportedInputs:
+    SEQUENCE = "ATGAAATTTGGGCCC"
+    CDS = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
+
+    def test_inserted_ambiguous_base_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t3\t.\tG\tGR\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "GR|UNSUPPORTED|MODIFIER|.|.|.|."
+
+    def test_ambiguous_two_base_insertion_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t4\t.\tA\tAN\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "AN|UNSUPPORTED|MODIFIER|.|.|.|."
+
+    def test_symbolic_alt_still_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t4\t.\tA\t<INS>\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "<INS>|UNSUPPORTED|MODIFIER|.|.|.|."
+
+    def test_spanning_alt_still_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t4\t.\tA\t*\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "*|UNSUPPORTED|MODIFIER|.|.|.|."
+
+    def test_breakend_alt_still_unsupported(self) -> None:
+        text = HEADER + COLUMNS + "chr1\t4\t.\tA\tA]chr2:9]\t.\t.\t.\n"
+        result = annotate_text(text, self.SEQUENCE, self.CDS)
+        assert gvann_of(result) == "A]chr2:9]|UNSUPPORTED|MODIFIER|.|.|.|."
 
 
 class TestHeaderAndInfo:

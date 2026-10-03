@@ -446,3 +446,47 @@ class TestAnnotateVcfCli:
         assert data_lines[1].endswith(
             "GVANN=<DEL>|UNSUPPORTED|MODIFIER|.|.|.|."
         )
+
+    def test_normalized_inframe_deletion_annotated(
+        self, reference_file, features_file
+    ) -> None:
+        # A normalized 3-base deletion: REF GAAA ALT G at POS 3 removes
+        # coding bases 4-6 (AAA).
+        vcf = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG\t.\t.\t.\n"
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features_file),
+            ],
+            vcf,
+        )
+        assert code == 0
+        assert err == ""
+        data_lines = [line for line in out.splitlines() if line.startswith("chr1")]
+        assert data_lines[0].endswith(
+            "GVANN=G|INFRAME_DELETION|MODERATE|t1|4|.|."
+        )
+
+    def test_frameshift_insertion_annotated_to_file(
+        self, tmp_path, reference_file, features_file
+    ) -> None:
+        vcf_path = tmp_path / "in.vcf"
+        vcf_path.write_text(
+            HEADER + COLUMNS + "chr1\t6\t.\tA\tAT\t.\t.\t.\n"
+        )
+        out_path = tmp_path / "out.vcf"
+        code, out, err = run(
+            [
+                "annotate-vcf", str(vcf_path),
+                "--reference", str(reference_file),
+                "--features", str(features_file),
+                "--output", str(out_path),
+            ]
+        )
+        assert code == 0
+        assert out == ""
+        assert err == ""
+        assert out_path.read_text().endswith(
+            "GVANN=AT|FRAMESHIFT|HIGH|t1|7|.|.\n"
+        )

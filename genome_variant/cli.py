@@ -328,7 +328,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     annotate_vcf_cmd = sub.add_parser(
         "annotate-vcf",
-        help="annotate VCF SNVs against a reference FASTA and GFF3 features",
+        help="annotate VCF SNVs and short ACGT indels against a "
+        "reference FASTA and GFF3 features",
     )
     annotate_vcf_cmd.add_argument(
         "input", help="VCF input file, or '-' for standard input"

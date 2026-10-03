@@ -10,11 +10,19 @@ Public API:
   every record of a :class:`~genome_variant.vcf.VcfFile`.
 
 CDS features are grouped by their GFF3 ``Parent`` attribute into
-transcripts.  The standard genetic code is used; only ``A``/``C``/``G``/``T``
-single-base substitutions inside a CDS are annotated with a coding
-consequence.  Every other ALT (indels, ambiguous or symbolic alleles)
-receives ``UNSUPPORTED``/``MODIFIER`` and records without a CDS hit
-receive ``NON_CODING``/``MODIFIER``.
+transcripts.  The standard genetic code is used.  Single-base ``A``/``C``/
+``G``/``T`` substitutions inside a CDS are classified by their codon
+change.  Ordinary ``A``/``C``/``G``/``T`` insertions and deletions are
+graded by their length change: a non-multiple of three is ``FRAMESHIFT``
+(``HIGH``) and an in-frame gain or loss of codons is
+``INFRAME_INSERTION``/``INFRAME_DELETION`` (``MODERATE``), provided the
+event lies inside a single CDS fragment of the transcript with the
+coding anchors (and, for deletions, every deleted base) intact; events
+that touch a CDS across fragments, through non-coding bases or without a
+coding anchor on both sides receive ``UNSUPPORTED``/``MODIFIER`` for that
+transcript.  Every other ALT (complex replacements, ambiguous or
+symbolic alleles) receives ``UNSUPPORTED``/``MODIFIER`` and records
+without a CDS hit receive ``NON_CODING``/``MODIFIER``.
 """
 
 from __future__ import annotations
@@ -71,8 +79,11 @@ _CONSEQUENCE_IMPACT = {
     "START_LOST": "HIGH",
     "STOP_GAINED": "HIGH",
     "STOP_LOST": "HIGH",
+    "FRAMESHIFT": "HIGH",
     "SYNONYMOUS": "LOW",
     "MISSENSE": "MODERATE",
+    "INFRAME_DELETION": "MODERATE",
+    "INFRAME_INSERTION": "MODERATE",
 }
 
 _GVANN_HEADER = (
@@ -121,6 +132,8 @@ class _Transcript:
     sites: dict[int, _CodonSite]
     #: Original fragments as (1-based start, 1-based end, source line).
     fragments: tuple[tuple[int, int, int], ...]
+    #: Genomic 0-based index -> 1-based coding position, every CDS base.
+    coding_positions: dict[int, int]
 
 
 def _gff_error(source: str, line_number: int, message: str) -> AnnotationFormatError:
@@ -329,6 +342,9 @@ def _build_transcript(
 ) -> _Transcript:
     layout = _build_layout(parent, fragments, source)
     sites: dict[int, _CodonSite] = {}
+    coding_positions: dict[int, int] = {}
+    for cds_pos, genomic_index in enumerate(layout, start=1):
+        coding_positions[genomic_index] = cds_pos
     for codon_number, start in enumerate(range(0, len(layout) - 2, 3), start=1):
         codon_indices = tuple(layout[start : start + 3])
         for position_in_codon, genomic_index in enumerate(codon_indices):
@@ -349,6 +365,7 @@ def _build_transcript(
                 for fragment in fragments
             )
         ),
+        coding_positions=coding_positions,
     )
 
 
@@ -408,6 +425,237 @@ def _is_acgt_snv(ref: str, alt: str) -> bool:
     )
 
 
+def _is_plain_allele(allele: str) -> bool:
+    """Whether *allele* is an ordinary sequence allele without symbols.
+
+    Mirrors the VCF reader's notion: symbolic (``<DEL>``), break-end
+    (brackets or a ``.`` join), spanning (``*``) and missing (``.``)
+    alleles are not plain.
+    """
+    return (
+        bool(allele)
+        and allele not in (".", "*")
+        and not any(char in "<>[]*." for char in allele)
+    )
+
+
+def _is_acgt_text(text: str) -> bool:
+    return bool(text) and all(char in "ACGT" for char in text)
+
+
+def _trim_alleles(ref: str, alt: str) -> tuple[int, int]:
+    """Measure REF/ALT's longest common prefix and suffix.
+
+    Returns ``(prefix, suffix)`` shared base counts; the suffix
+    comparison never reuses a base consumed by the prefix.
+    """
+    prefix = 0
+    while prefix < len(ref) and prefix < len(alt) and ref[prefix] == alt[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < len(ref) - prefix
+        and suffix < len(alt) - prefix
+        and ref[len(ref) - 1 - suffix] == alt[len(alt) - 1 - suffix]
+    ):
+        suffix += 1
+    return prefix, suffix
+
+
+def _containing_fragment(
+    transcript: _Transcript, genomic_index: int
+) -> int | None:
+    """Index of the CDS fragment covering *genomic_index*, if any."""
+    for number, (start, end, _line_number) in enumerate(transcript.fragments):
+        if start - 1 <= genomic_index <= end - 1:
+            return number
+    return None
+
+
+def _indel_transcript(
+    is_deletion: bool,
+    length: int,
+    left_anchor: int,
+    right_anchor: int,
+    deleted_indices: tuple[int, ...],
+    chromosome_length: int,
+    transcript: _Transcript,
+) -> tuple[str, str, int] | None:
+    """Grade one pure indel against one transcript.
+
+    Returns ``(consequence, impact, cds_pos)`` — consequence is
+    ``UNSUPPORTED`` when the event touches the CDS but cannot be judged —
+    or ``None`` when the event does not touch the transcript.
+
+    Anchors are the genomic bases immediately flanking the event, found
+    from coordinates alone (a minimized indel carries only one flank in
+    the allele); an index outside the chromosome has no anchor at all.
+    """
+    coding = transcript.coding_positions
+
+    def coding_at(index: int) -> int | None:
+        if 0 <= index < chromosome_length:
+            return coding.get(index)
+        return None
+
+    left_cds = coding_at(left_anchor)
+    right_cds = coding_at(right_anchor)
+    deleted_cds = [
+        coding[index]
+        for index in deleted_indices
+        if index in coding
+    ]
+
+    if not deleted_cds and left_cds is None and right_cds is None:
+        return None
+
+    if is_deletion:
+        cds_pos = min(
+            deleted_cds,
+            default=(
+                left_cds if left_cds is not None else right_cds
+            ),
+        )
+
+        # The deleted bases must all be coding and consecutive in the
+        # assembled coding sequence (coding positions work on either
+        # strand), and the deleted stretch together with both flanking
+        # anchors must lie inside one single CDS fragment.  A missing or
+        # non-coding anchor (fragment edge, intron, chromosome end) makes
+        # the event unjudgeable for this transcript.
+        anchor_positions = [
+            value
+            for value in (left_cds, right_cds)
+            if value is not None
+        ]
+        all_positions = anchor_positions + deleted_cds
+        expected_count = len(deleted_indices) + 2
+        contiguous = (
+            len(all_positions) == expected_count
+            and max(all_positions) - min(all_positions) + 1
+            == expected_count
+        )
+        fragments = {
+            _containing_fragment(transcript, index)
+            for index in (left_anchor, right_anchor, *deleted_indices)
+        }
+        eligible = (
+            len(deleted_cds) == len(deleted_indices)
+            and left_cds is not None
+            and right_cds is not None
+            and contiguous
+            and len(fragments) == 1
+            and next(iter(fragments)) is not None
+        )
+        if not eligible:
+            return ("UNSUPPORTED", "MODIFIER", cds_pos)
+        consequence = (
+            "FRAMESHIFT" if length % 3 else "INFRAME_DELETION"
+        )
+        return (consequence, _CONSEQUENCE_IMPACT[consequence], cds_pos)
+
+    # Insertion: the boundary must lie between two coding bases adjacent
+    # in coding direction (coding order descends with genomic coordinates
+    # on the minus strand), and both flanks must belong to one CDS
+    # fragment.  CDS_POS names the first coding base to the right of the
+    # boundary in coding direction, the larger of the two positions.
+    cds_pos = (
+        max(left_cds, right_cds)
+        if left_cds is not None and right_cds is not None
+        else (left_cds if left_cds is not None else right_cds)
+    )
+    adjacent = (
+        left_cds is not None
+        and right_cds is not None
+        and abs(right_cds - left_cds) == 1
+    )
+    left_fragment = _containing_fragment(transcript, left_anchor)
+    right_fragment = _containing_fragment(transcript, right_anchor)
+    eligible = (
+        adjacent
+        and left_fragment is not None
+        and left_fragment == right_fragment
+    )
+    if not eligible:
+        return ("UNSUPPORTED", "MODIFIER", cds_pos)
+    consequence = (
+        "FRAMESHIFT" if length % 3 else "INFRAME_INSERTION"
+    )
+    return (consequence, _CONSEQUENCE_IMPACT[consequence], cds_pos)
+
+
+def _annotate_indel(
+    record: VcfRecord,
+    alt: str,
+    transcripts: tuple[_Transcript, ...],
+    chromosome: str,
+) -> str | None:
+    """Annotate one pure ACGT indel ALT, or return ``None`` if not one.
+
+    ``None`` covers symbolic, break-end, spanning and missing ALTs,
+    ambiguous alleles and complex replacements (remainders on both
+    sides), which stay globally ``UNSUPPORTED``.
+    """
+    if not (
+        _is_plain_allele(record.ref)
+        and _is_plain_allele(alt)
+        and _is_acgt_text(record.ref)
+        and _is_acgt_text(alt)
+    ):
+        return None
+
+    prefix, suffix = _trim_alleles(record.ref, alt)
+    ref_remainder = record.ref[prefix : len(record.ref) - suffix]
+    alt_remainder = alt[prefix : len(alt) - suffix]
+    if ref_remainder and alt_remainder:
+        # Bases changed on both sides: a complex replacement, not an indel.
+        return None
+    if not ref_remainder and not alt_remainder:
+        return None
+    is_deletion = bool(ref_remainder)
+    length = len(ref_remainder) if is_deletion else len(alt_remainder)
+
+    # Flanks come from genomic coordinates, not from the allele's
+    # retained bases, so minimized and right-anchored representations of
+    # one event are judged identically.  Both indices may point outside
+    # the chromosome at its edges, which means there is no anchor.
+    if is_deletion:
+        first = record.pos - 1 + prefix
+        deleted_indices = tuple(range(first, first + length))
+        left_anchor = first - 1
+        right_anchor = first + length
+    else:
+        deleted_indices = ()
+        gap = record.pos - 1 + prefix
+        left_anchor = gap - 1
+        right_anchor = gap
+
+    items: list[str] = []
+    # transcripts are already ordered by Parent, so hits stay lexicographic.
+    for transcript in transcripts:
+        if transcript.seqid != record.chrom:
+            continue
+        result = _indel_transcript(
+            is_deletion,
+            length,
+            left_anchor,
+            right_anchor,
+            deleted_indices,
+            len(chromosome),
+            transcript,
+        )
+        if result is None:
+            continue
+        consequence, impact, cds_pos = result
+        items.append(
+            f"{alt}|{consequence}|{impact}|{transcript.parent}|{cds_pos}|.|."
+        )
+
+    if not items:
+        return f"{alt}|NON_CODING|MODIFIER|{_NO_TRANSCRIPT}"
+    return ",".join(items)
+
+
 def _classify(codon_number: int, old_codon: str, new_codon: str) -> tuple[str, str]:
     old_aa = _GENETIC_CODE[old_codon]
     new_aa = _GENETIC_CODE[new_codon]
@@ -431,7 +679,10 @@ def _annotate_alt(
     chromosome: str,
 ) -> str:
     if not _is_acgt_snv(record.ref, alt):
-        return f"{alt}|UNSUPPORTED|MODIFIER|{_NO_TRANSCRIPT}"
+        indel = _annotate_indel(record, alt, transcripts, chromosome)
+        return indel if indel is not None else (
+            f"{alt}|UNSUPPORTED|MODIFIER|{_NO_TRANSCRIPT}"
+        )
 
     genomic_index = record.pos - 1
     items: list[str] = []
@@ -540,9 +791,18 @@ def annotate_vcf(
     was missing).  Coding consequences are ``START_LOST``,
     ``STOP_GAINED``, ``STOP_LOST``, ``SYNONYMOUS`` and ``MISSENSE`` with
     impacts ``HIGH``, ``HIGH``, ``HIGH``, ``LOW`` and ``MODERATE``;
-    transcripts are listed by lexicographic Parent.  SNVs outside every
-    CDS get ``NON_CODING``/``MODIFIER`` and non-SNV, ambiguous or
-    symbolic ALTs get ``UNSUPPORTED``/``MODIFIER``.
+    transcripts are listed by lexicographic Parent.  Pure ``ACGT``
+    insertions and deletions are graded per transcript after trimming the
+    longest common prefix and suffix of REF and ALT: a length change not
+    divisible by three is ``FRAMESHIFT``/``HIGH`` and an in-frame change
+    is ``INFRAME_INSERTION`` or ``INFRAME_DELETION``/``MODERATE``, when
+    the event lies inside one CDS fragment with intact coding anchors;
+    events that touch a CDS across fragments, through non-coding bases or
+    without a coding anchor on both sides get ``UNSUPPORTED``/``MODIFIER``
+    for that transcript.  SNVs and pure indels outside every CDS get
+    ``NON_CODING``/``MODIFIER``; complex replacements and non-SNV,
+    ambiguous, symbolic, break-end, spanning or missing ALTs get
+    ``UNSUPPORTED``/``MODIFIER``.
 
     Every record's REF is checked against the reference first.  Raises
     :class:`~genome_variant.vcf.ReferenceMismatchError` for an
