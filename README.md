@@ -166,6 +166,26 @@ genome-variant-toolkit call-variants REFERENCE READS \
 - 无候选时仍输出完整头部（7 行 `##` 元信息加 `#CHROM` 列头）。写文件时仅在全部读取与调用成功后经同目录临时文件原子替换，失败保留原目标；读段分批不影响逐字节结果。
 - 返回码：成功 `0`；参数错误、非法阈值（在消费输入前报错）、空参考、重复参考标识、非法样本名、缺少质量或质量长度错误、FASTQ 与序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### batch-call-variants
+
+按 JSON Lines 清单对多个样本的 FASTQ 读段逐一调用变异并直接合并汇总，不产生中间 VCF：
+
+```bash
+genome-variant-toolkit batch-call-variants MANIFEST \
+    --reference REFERENCE \
+    [--min-base-quality N] [--min-alt-count N] \
+    [--min-alt-fraction F] [--homozygous-fraction F] \
+    [--call-indels] [--max-indel-length N] \
+    [--output OUTPUT]
+```
+
+- 清单为 JSON Lines：每个非空行是仅含字符串字段 `sample` 与 `reads` 的 JSON 对象；`sample` 不得为空、纯空白或含制表符，且在清单内唯一；`reads` 为 FASTQ 路径且不得为 `-`。文件清单中的相对 `reads` 按清单所在目录解析，流清单（`MANIFEST` 为 `-`）按当前工作目录解析。
+- 每个清单项按原顺序读取读段，以 `sample` 为样本名，按 `call-variants` 的质量门槛、等位计数、等位比例、基因型及可选短插入缺失语义独立调用；各阈值选项与 `--call-indels`、`--max-indel-length` 的默认值、约束和结果与逐样本调用一致。
+- 各样本结果按 `summarize-variants` 的参考规范化规则合并，输出与其相同的紧凑 JSON Lines：字段、统计口径与排序一致，`samples` 保持清单顺序，没有变异时输出为空。相同参考、清单、读段与参数跨运行产生逐字节相同的结果。
+- `MANIFEST`、`--reference` 与 `--output` 沿用标准流约定，但清单与参考不能同时来自标准输入。
+- 输出到文件时仅在全部样本调用与汇总成功后经同目录临时文件原子替换；失败保留已有目标且不留临时结果。
+- 返回码：成功 `0`；参数、清单、序列、质量或参考数据错误 `2`（标准错误单行、标准输出为空）；文件访问或写入失败 `1`。
+
 ### coverage-report
 
 统计多记录参考 FASTA 的覆盖度与一致性，按参考输入顺序输出 JSON Lines，每条参考记录一行；映射沿用 `map-reads` 的局部比对计分、正反链搜索与候选裁决，FASTQ 质量值不参与统计：
@@ -303,6 +323,13 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `summarize_variants(manifest, reference)`：`manifest` 为清单路径/流或 `ManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。逐个读取、校验并以参考规范化每个单样本 VCF，按规范化后的 `CHROM`/`POS`/`REF`/`ALT` 跨样本合并等价调用；返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序。参考问题抛 `ReferenceMismatchError`/`VcfFormatError`，文件访问失败抛 `OSError`。
 - `render_summaries(summaries)`：序列化为紧凑 UTF-8 JSON Lines（非 ASCII 原样、`\n` 换行），非空结果末尾恰有一个换行，空结果为空字符串。
 
+模块 `genome_variant.batch` 提供：
+
+- `BatchManifestError`（`ValueError` 子类）：清单非合法 JSON、行不是对象、字段缺失/多余/类型非法、`sample` 为空、纯空白或含制表符、样本名重复，或 `reads` 为空、非字符串或为 `-` 时抛出；消息含清单来源与一基行号。
+- `BatchManifestEntry(line_number, sample, reads)`：一条清单项，含一基清单行号、唯一样本名与已解析的 FASTQ 路径。
+- `read_batch_manifest(source)`：接受清单文本路径或文本流，忽略空行，返回按清单次序的 `BatchManifestEntry` 元组；文件清单的相对 `reads` 按其目录解析，流清单按当前工作目录解析。
+- `batch_call_variants(manifest, reference, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, call_indels=False, max_indel_length=50)`：`manifest` 为清单路径/流或 `BatchManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。按清单顺序对每个样本的 FASTQ 读段以 `call_variants` 语义独立调用（阈值参数与约束相同），样本名取清单 `sample`；各样本结果按 `summarize_variants` 的参考规范化规则合并，不产生中间 VCF。返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序；无变异时返回空元组。非法阈值在消费任何读段前抛 `ValueError`，空参考或重复参考标识抛 `VariantCallingError`，清单问题抛 `BatchManifestError`，读段格式、碱基与质量问题抛对应现有异常，文件访问失败抛 `OSError`。
+
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 
 异常：
@@ -312,6 +339,7 @@ genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
 - `ReferenceMismatchError`（位于 `genome_variant.vcf`）：参考中缺少或重复 CHROM，或 REF 与参考不一致；消息包含 CHROM、POS 以及可判定的期望值与实际值。
 - `AnnotationFormatError`（位于 `genome_variant.annotation`）：GFF3 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN`；消息包含来源与一基行号。
 - `ManifestError`（位于 `genome_variant.summary`）：清单结构/字段/样本唯一性错误，或样本 VCF 结构与基因型字段不合规、同一 VCF 规范化后键重复；消息含清单文件与行号，或 VCF 来源与一基行号。
+- `BatchManifestError`（位于 `genome_variant.batch`）：批量清单结构/字段/样本唯一性错误，或 `reads` 为 `-`；消息含清单来源与一基行号。
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
 - `VariantCallingError`（`ValueError` 子类，位于 `genome_variant.calling`）：变异调用时参考集合为空、参考标识重复或样本名非法。
