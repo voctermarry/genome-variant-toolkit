@@ -15,6 +15,7 @@ from .alignment import PairwiseAlignment, align_pair
 from .annotation import AnnotationFormatError, annotate_vcf
 from .calling import VariantCallingError, call_variants
 from .coverage import coverage_report
+from .deduplication import deduplicate_reads
 from .kmer import build_kmer_index
 from .mapping import MappingReferenceError, map_reads
 from .quality import ReadQualityError, filter_reads
@@ -182,6 +183,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="drop reads shorter than N bases after trimming (default: 30)",
     )
     filter_reads_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
+
+    dedup_cmd = sub.add_parser(
+        "deduplicate-reads",
+        help="deduplicate FASTA/FASTQ reads before mapping and variant calling",
+    )
+    dedup_cmd.add_argument("input", help="input file, or '-' for standard input")
+    dedup_cmd.add_argument(
+        "--input-format",
+        choices=("fasta", "fastq", "auto"),
+        default="auto",
+        help="input format (default: auto-detect from the first title line)",
+    )
+    dedup_cmd.add_argument(
+        "--canonical",
+        action="store_true",
+        help="also treat a sequence and its IUPAC reverse complement as "
+        "duplicates (default: only identical sequences are grouped)",
+    )
+    dedup_cmd.add_argument(
         "--output",
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
@@ -557,6 +581,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "filter-reads":
         return _run_filter_reads(args, parser)
 
+    if args.command == "deduplicate-reads":
+        return _run_deduplicate_reads(args, parser)
+
     if args.command == "kmer-index":
         return _run_kmer_index(args, parser)
 
@@ -725,6 +752,108 @@ def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser)
             # On failure the temporary file was already closed and removed
             # by _discard_temporary; on success it was closed explicitly
             # before os.replace. This only closes a still-open temp stream.
+            if close_output and not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_input:
+            input_stream.close()
+
+    return 0
+
+
+def _run_deduplicate_reads(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    if args.input == "-":
+        input_stream = sys.stdin
+        close_input = False
+    else:
+        try:
+            input_stream = open(args.input, "r", encoding="utf-8", newline="")
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        close_input = True
+
+    try:
+        records: Iterable[SequenceRecord] = read_sequences(
+            input_stream, format=args.input_format
+        )
+        # Resolve the output format from the first record: output always
+        # mirrors the input format.  Peeking here also makes sure an empty
+        # input is reported as a format error (existing reader semantics)
+        # rather than as empty success.
+        try:
+            first = next(records)
+        except (SequenceFormatError, SequenceValidationError) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        output_format = "fastq" if first.quality is not None else "fasta"
+        records = _prefix(first, records)
+
+        # Deduplicate (validating every record) before any output is
+        # produced, so a failure never creates partial output or touches
+        # an existing output file.
+        try:
+            unique_records = deduplicate_reads(
+                records, canonical=args.canonical
+            )
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            output_stream = sys.stdout
+            close_output = False
+            temporary_path = None
+        else:
+            output_stream, temporary_path = _open_temporary_output(
+                args.output, parser, prefix=".deduplicate-reads-"
+            )
+            if output_stream is None:
+                return 1
+            close_output = True
+
+        try:
+            try:
+                write_sequences(unique_records, output_stream, format=output_format)
+            except _READ_ERRORS as exc:
+                if temporary_path is not None:
+                    _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 2
+            except OSError as exc:
+                if temporary_path is not None:
+                    _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+
+            if temporary_path is not None:
+                try:
+                    output_stream.flush()
+                    output_stream.close()
+                    os.replace(temporary_path, args.output)
+                except OSError as exc:
+                    _discard_temporary(output_stream, temporary_path)
+                    print(f"{parser.prog}: {exc}", file=sys.stderr)
+                    return 1
+        finally:
+            # On failure the temporary file was already closed and removed
+            # by _discard_temporary; on success it was closed explicitly
+            # before os.replace. This only closes a still-open stream.
             if close_output and not output_stream.closed:
                 try:
                     output_stream.close()
