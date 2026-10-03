@@ -25,6 +25,7 @@ from .sequence_io import (
     read_sequences,
     write_sequences,
 )
+from .summarize import ManifestFormatError, parse_manifest, summarize_variants
 from .vcf import (
     ReferenceMismatchError,
     VcfFormatError,
@@ -513,6 +514,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    summarize_cmd = sub.add_parser(
+        "summarize-variants",
+        help="summarize single-sample VCFs listed in a manifest into "
+        "per-variant JSON Lines",
+    )
+    summarize_cmd.add_argument(
+        "manifest", help="manifest JSON Lines file, or '-' for standard input"
+    )
+    summarize_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file (required); '-' denotes standard input",
+    )
+    summarize_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -554,6 +574,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "coverage-report":
         return _run_coverage_report(args, parser)
+
+    if args.command == "summarize-variants":
+        return _run_summarize_variants(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -1504,6 +1527,126 @@ def _run_coverage_report(args: argparse.Namespace, parser: argparse.ArgumentPars
             ref_stream.close()
         if close_reads:
             read_stream.close()
+
+    return 0
+
+
+def _run_summarize_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.manifest == "-" and args.reference == "-":
+        print(
+            f"{parser.prog}: manifest and reference cannot both be read "
+            "from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    manifest_stream, close_manifest, code = _open_input(args.manifest, parser)
+    if manifest_stream is None:
+        return code
+    ref_stream, close_ref, ref_code = _open_input(args.reference, parser)
+    if ref_stream is None:
+        if close_manifest:
+            manifest_stream.close()
+        return ref_code
+
+    try:
+        # Parse the manifest, the reference and every VCF completely and
+        # merge all calls before any output is produced, so a failure
+        # never creates partial output or touches an existing target.
+        try:
+            entries = parse_manifest(
+                manifest_stream,
+                source="<stdin>" if args.manifest == "-" else args.manifest,
+                base_dir=(
+                    "" if args.manifest == "-" else os.path.dirname(args.manifest)
+                ),
+            )
+        except ManifestFormatError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            reference_records = list(read_sequences(ref_stream, format="fasta"))
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
+            return 1
+
+        documents = []
+        for entry in entries:
+            try:
+                if entry.vcf == "-":
+                    document = read_vcf(sys.stdin)
+                else:
+                    document = read_vcf(entry.vcf)
+            except VcfFormatError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 2
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            documents.append((entry.sample, document))
+
+        try:
+            summaries = summarize_variants(documents, reference_records)
+        except (ManifestFormatError, VcfFormatError, ReferenceMismatchError) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+
+        lines = [
+            json.dumps(
+                summary.to_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for summary in summaries
+        ]
+        text = "".join(line + "\n" for line in lines)
+
+        if args.output == "-":
+            # Keep output byte-stable across platforms: no newline
+            # translation on standard output.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(newline="")
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError as exc:
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+
+        output_stream, temporary_path = _open_temporary_output(
+            args.output, parser, prefix=".summarize-variants-"
+        )
+        if output_stream is None:
+            return 1
+        try:
+            try:
+                output_stream.write(text)
+                output_stream.flush()
+                output_stream.close()
+                os.replace(temporary_path, args.output)
+            except OSError as exc:
+                _discard_temporary(output_stream, temporary_path)
+                print(f"{parser.prog}: {exc}", file=sys.stderr)
+                return 1
+        finally:
+            if not output_stream.closed:
+                try:
+                    output_stream.close()
+                except OSError:
+                    pass
+    finally:
+        if close_manifest:
+            manifest_stream.close()
+        if close_ref:
+            ref_stream.close()
 
     return 0
 

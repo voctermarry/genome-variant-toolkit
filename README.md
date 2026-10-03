@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV（可选短插入/短缺失）变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV（可选短插入/短缺失）变异调用、参考序列感知的 VCF 规范化、基于 GFF3 CDS 的 VCF 变异注释与影响分级，以及清单驱动的多样本变异汇总功能。
 
 ## 环境与安装
 
@@ -201,6 +201,23 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 - 成功输出使用制表符与 `\n`，末尾恰有一个换行；无记录的 VCF 仍写出含 `GVANN` 定义的完整头部。写文件时先完成全部读取、校验与注释，再经同目录临时文件原子替换，失败保留原文件。相同输入跨批次逐字节一致。
 - 返回码：成功 `0`；参数或数据错误（`AnnotationFormatError`、`VcfFormatError`、`ReferenceMismatchError`、参考 FASTA 序列错误）均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
+### summarize-variants
+
+读取 JSON Lines 清单列出的多个单样本 VCF，结合必需的参考 FASTA 汇总为逐变异 JSON Lines：
+
+```bash
+genome-variant-toolkit summarize-variants MANIFEST --reference REFERENCE \
+    [--output OUTPUT]
+```
+
+- `MANIFEST`、`--reference` 与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但清单与参考不能同时使用标准输入；参考按 FASTA 解析。清单文件中的相对 VCF 路径按清单所在目录解析，标准输入清单中的相对路径按当前工作目录解析。
+- 清单每个非空行是一个仅含字符串字段 `sample` 与 `vcf` 的 JSON 对象；`sample` 非空、不含制表符且全局唯一，`vcf` 指向单样本 VCF（`-` 表示标准输入）。
+- 每个 VCF 必须恰有一个与清单同名的样本；记录仅接受一个普通序列型 ALT，FILTER 只能为 `PASS` 或 `.`，FORMAT 必须包含 `GT`、`DP`、`AD`；`GT` 仅接受 `0/1` 或 `1/1`，`DP` 为非负整数，`AD` 恰含两个非负整数且总和等于 `DP`。
+- 记录按 `normalize-vcf` 的规则校验、最简化并左对齐，再以 `CHROM`、`POS`、`REF`、`ALT` 合并等价调用；同一样本规范化后键重复视为数据错误。
+- 每行紧凑 JSON 固定按顺序包含 `chrom`、`pos`、`ref`、`alt`、`sample_count`、`allele_count`、`depth`、`samples`；`samples` 仅收录实际调用者并保持清单次序，每项固定包含 `sample`、`gt`、`dp`、`ad`（二元数组）。`sample_count` 为样本项数，`allele_count` 对 `0/1` 计一、对 `1/1` 计二，`depth` 为 `DP` 之和。结果按参考记录次序、再按 `POS`、`REF`、`ALT` 升序排列；无变异时输出为空。
+- 成功输出为 UTF-8 紧凑 JSON，非 ASCII 原样保留，统一使用 `\n`，非空结果末尾恰有一个换行。写文件时先完成全部读取、校验与汇总，再经同目录临时文件原子替换，失败保留原文件且不产生部分标准输出。相同输入跨运行逐字节一致。
+- 返回码：成功 `0`；清单 JSON、字段、样本唯一性、VCF 结构或基因型字段不合规以及 `VcfFormatError`、`ReferenceMismatchError`、参考 FASTA 序列错误均为 `2`（标准错误单行并含清单行号或 VCF 来源与行号，标准输出为空）；文件读写错误 `1`。
+
 ## Python 公开接口
 
 模块 `genome_variant.sequence_io` 提供：
@@ -248,8 +265,16 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 - `normalize_record(record, reference)` 与 `normalize_vcf(document, reference)`：`reference` 为 CHROM 到参考序列的映射或 `SequenceRecord` 可迭代对象。先校验 POS 处 REF；再将全部序列型等位基因作为整体移除共同最长后缀与前缀（每等位至少留一个碱基，POS 随前缀调整），长度不同时左移到表示相同单倍型的最小 POS，每次移动后重新最简化。特殊 ALT 记录仅校验 REF，不剪裁不左移；ALT 次序及 ID、QUAL、FILTER、INFO、FORMAT、样本文本与记录顺序不变。
 - `render_vcf(document)` 与 `write_vcf(document, output)`：使用制表符与 `\n` 序列化，末尾恰有一个换行；无记录时仍写出完整头部。`write_vcf` 接受文本路径或文本流。
 
-模块 `genome_variant.annotation` 提供：
+模块 `genome_variant.summarize` 提供：
 
+- `ManifestFormatError`（`ValueError` 子类）：清单 JSON 非法、字段不恰为 `sample` 与 `vcf`、字段非字符串、样本名为空、含制表符或重复时抛出；消息含来源与一基行号。
+- `ManifestEntry(sample, vcf, line_number)`：一行清单；`vcf` 为按清单目录解析后的路径（`-` 保持不变），`line_number` 为一基清单行号。
+- `parse_manifest(lines, *, source="<manifest>", base_dir="")`：解析并校验清单 JSON Lines，空行跳过；相对 `vcf` 路径按 `base_dir`（空表示当前工作目录）解析，返回 `ManifestEntry` 列表。
+- `SampleCall(sample, gt, dp, ad)`：一个样本在某变异处的调用。
+- `VariantSummary(chrom, pos, ref, alt, samples)`：一个合并变异及其调用样本（保持清单次序）；属性 `sample_count`、`allele_count`、`depth` 与方法 `to_dict()` 给出固定键序的 JSON 就绪映射。
+- `summarize_variants(documents, reference)`：`documents` 按清单次序产生 `(sample, VcfFile)`；每个 VCF 恰声明该一个样本，记录须含一个普通序列型 ALT、FILTER 为 `PASS` 或 `.`、FORMAT 含 `GT`（`0/1` 或 `1/1`）、`DP`（非负整数）与 `AD`（两个非负整数且和等于 `DP`）。记录按 `normalize_vcf` 的规则最简化并左对齐后按 `CHROM`、`POS`、`REF`、`ALT` 合并，同一样本规范化后键重复为数据错误；结果按参考记录次序、`POS`、`REF`、`ALT` 升序排列。样本名重复抛 `ManifestFormatError`，记录或基因型不合规抛 `VcfFormatError`（含 VCF 来源与一基行号），参考缺少/重复 CHROM 或 REF 不匹配抛 `ReferenceMismatchError`。
+
+模块 `genome_variant.annotation` 提供：
 - `AnnotationFormatError`（`ValueError` 子类）：GFF3 的 CDS 行列字段数、坐标或 `phase` 非法、缺少 `Parent`、链非 `+`/`-`、同一 `Parent` 的片段跨序列或阅读框矛盾、CDS 越过序列末端，或 VCF 已声明/已使用 `GVANN` 时抛出；消息含来源名与一基行号。
 - `annotate_vcf(document, reference, features)`：`document` 为 `VcfFile`，`reference` 为 CHROM 到序列的映射或 `SequenceRecord` 可迭代对象，`features` 为 GFF3 文本路径或文本流。以 GFF3 的 CDS 为注释范围，按 `Parent` 组合转录本片段、依据链与 `phase` 建立阅读框，用标准遗传密码判定 `A/C/G/T` 单碱基替换。每个 ALT 依次注释，多转录本命中按 `Parent` 字典序；后果为 `START_LOST`、`STOP_GAINED`、`STOP_LOST`（均 `HIGH`）、`SYNONYMOUS`（`LOW`）、`MISSENSE`（`MODERATE`），未命中 CDS 的 SNV 为 `NON_CODING`/`MODIFIER`，非 SNV、歧义或符号等位基因为 `UNSUPPORTED`/`MODIFIER`。返回追加唯一 `##INFO=<ID=GVANN,...>` 定义、并在每条记录 INFO 末尾（INFO 缺失时以其开始）追加 `GVANN=ALT|CONSEQUENCE|IMPACT|TRANSCRIPT|CDS_POS|CODON_CHANGE|AA_CHANGE` 的新 `VcfFile`；记录顺序、ALT 次序、样本列与既有字段不变。参考缺少/重复 CHROM 或 REF 不匹配抛 `ReferenceMismatchError`，记录越界抛 `VcfFormatError`。
 
@@ -264,6 +289,7 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 - `SequenceValidationError`：非法碱基；消息指出记录标识、符号与一基位置。
 - `ReadQualityError`（`ValueError` 子类，位于 `genome_variant.quality`）：记录没有质量值、质量数量与序列长度不等或质量值超出 0 至 93；消息包含记录标识。
 - `VariantCallingError`（`ValueError` 子类，位于 `genome_variant.calling`）：变异调用时参考集合为空、参考标识重复或样本名非法。
+- `ManifestFormatError`（`ValueError` 子类，位于 `genome_variant.summarize`）：清单 JSON 非法、字段不恰为 `sample` 与 `vcf`、字段非字符串、样本名为空、含制表符或重复；消息含来源与一基行号。
 - 打开路径失败保留 `OSError`，迭代期间的其他异常不会被吞掉。
 
 ## 限制
