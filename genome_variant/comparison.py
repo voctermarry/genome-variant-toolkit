@@ -31,15 +31,13 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from .sequence_io import SequenceRecord, read_sequences
-from .vcf import (
-    VcfFile,
-    VcfFormatError,
-    VcfRecord,
-    _is_plain_allele,
-    normalize_vcf,
-    read_vcf,
+from ._callset import (
+    reference_order,
+    require_single_sample,
+    validated_records,
 )
+from .sequence_io import SequenceRecord, read_sequences
+from .vcf import VcfFile, VcfFormatError, read_vcf
 
 __all__ = [
     "VariantComparisonError",
@@ -48,9 +46,6 @@ __all__ = [
     "compare_variants",
     "render_comparison",
 ]
-
-#: Genotypes accepted from the FORMAT/GT field.
-_GENOTYPES = ("0/1", "1/1")
 
 #: Difference statuses, mirroring the count fields of the same names.
 GENOTYPE_MISMATCH = "genotype_mismatch"
@@ -119,86 +114,23 @@ class VariantComparison:
         return f"{self.matched / total:.6f}"
 
 
-def _record_error(source: str, record: VcfRecord, message: str) -> VariantComparisonError:
-    if source and record.line_number:
-        return VariantComparisonError(f"{source}:{record.line_number}: {message}")
-    if record.line_number:
-        return VariantComparisonError(f"line {record.line_number}: {message}")
-    return VariantComparisonError(message)
-
-
-def _extract_gt(record: VcfRecord, source: str) -> str:
-    """Validate one record against the call-set constraints and return its GT."""
-    if record.filter not in ("PASS", "."):
-        raise _record_error(
-            source, record, f"FILTER must be PASS or '.', got {record.filter!r}"
-        )
-    if len(record.alt) != 1:
-        raise _record_error(
-            source,
-            record,
-            f"expected exactly one ALT allele, got {len(record.alt)}",
-        )
-    if not _is_plain_allele(record.alt[0]):
-        raise _record_error(
-            source, record, "ALT must be a single ordinary sequence allele"
-        )
-    if record.format_text is None:
-        raise _record_error(source, record, "missing FORMAT column")
-
-    format_fields = record.format_text.split(":")
-    if len(format_fields) != len(set(format_fields)):
-        raise _record_error(source, record, "FORMAT contains duplicate field IDs")
-    if "GT" not in format_fields:
-        raise _record_error(source, record, "FORMAT must contain GT")
-
-    if len(record.sample_text) != 1:
-        raise _record_error(source, record, "expected one sample column")
-    values = record.sample_text[0].split(":")
-    if len(values) != len(format_fields):
-        raise _record_error(
-            source,
-            record,
-            f"sample has {len(values)} fields but FORMAT lists {len(format_fields)}",
-        )
-    gt = dict(zip(format_fields, values))["GT"]
-    if gt not in _GENOTYPES:
-        raise _record_error(
-            source, record, f"GT must be 0/1 or 1/1, got {gt!r}"
-        )
-    return gt
-
-
 def _extract_calls(
     document: VcfFile,
     reference_records: Sequence[SequenceRecord],
 ) -> tuple[str, dict[tuple[str, int, str, str], str]]:
-    """Validate and normalize *document*; return its sample and key -> GT map."""
-    samples = document.header.samples
-    if len(samples) != 1:
-        raise VariantComparisonError(
-            f"{document.source or '<input>'}:1: VCF must declare exactly one "
-            f"sample, got {len(samples)}"
-        )
+    """Validate and normalize *document*; return its sample and key -> GT map.
 
-    # Validate every record first, then normalize the whole document in
-    # one pass; records map one-to-one and keep their order, so the
-    # extracted genotypes pair back by index.
-    gts = [_extract_gt(record, document.source) for record in document.records]
-    normalized = normalize_vcf(document, reference_records)
-
-    calls: dict[tuple[str, int, str, str], str] = {}
-    for record, gt in zip(normalized.records, gts):
-        key = (record.chrom, record.pos, record.ref, record.alt[0])
-        if key in calls:
-            raise _record_error(
-                document.source,
-                record,
-                "duplicate normalized variant "
-                f"{record.chrom}:{record.pos}:{record.ref}>{record.alt[0]}",
-            )
-        calls[key] = gt
-    return samples[0], calls
+    Uses the shared single-sample call-set semantics
+    (:mod:`genome_variant._callset`) so FILTER, ALT, FORMAT, GT, reference
+    normalization, the normalized key and duplicate-key rejection are
+    interpreted exactly as in the summary entry; comparison only
+    requires a comparable GT and never DP or AD.
+    """
+    sample = require_single_sample(document, VariantComparisonError)
+    calls = validated_records(
+        document, reference_records, VariantComparisonError, require_depth=False
+    )
+    return sample, {call.key: call.gt for call in calls}
 
 
 def compare_variants(
@@ -249,9 +181,7 @@ def compare_variants(
 
     # Reference record order for sorting; every key's CHROM was checked
     # during normalization, so lookups below always succeed.
-    order: dict[str, int] = {}
-    for index, record in enumerate(reference_records):
-        order.setdefault(record.identifier, index)
+    order = reference_order(reference_records)
 
     matched = 0
     genotype_mismatch = 0
