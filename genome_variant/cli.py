@@ -25,6 +25,11 @@ from .sequence_io import (
     read_sequences,
     write_sequences,
 )
+from .summary import (
+    ManifestError,
+    render_summaries,
+    summarize_variants,
+)
 from .vcf import (
     ReferenceMismatchError,
     VcfFormatError,
@@ -513,6 +518,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
     )
+
+    summarize_cmd = sub.add_parser(
+        "summarize-variants",
+        help="summarize single-sample VCFs listed by a JSON Lines manifest",
+    )
+    summarize_cmd.add_argument(
+        "manifest", help="JSON Lines manifest file, or '-' for standard input"
+    )
+    summarize_cmd.add_argument(
+        "--reference",
+        required=True,
+        help="reference FASTA file (required); '-' denotes standard input",
+    )
+    summarize_cmd.add_argument(
+        "--output",
+        default="-",
+        help="output file, or '-' for standard output (default: standard output)",
+    )
     return parser
 
 
@@ -554,6 +577,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "coverage-report":
         return _run_coverage_report(args, parser)
+
+    if args.command == "summarize-variants":
+        return _run_summarize_variants(args, parser)
 
     parser.print_help()  # pragma: no cover - every subcommand is handled above
     return 0
@@ -1504,6 +1530,80 @@ def _run_coverage_report(args: argparse.Namespace, parser: argparse.ArgumentPars
             ref_stream.close()
         if close_reads:
             read_stream.close()
+
+    return 0
+
+
+def _run_summarize_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.manifest == "-" and args.reference == "-":
+        print(
+            f"{parser.prog}: manifest and reference cannot both be read "
+            "from standard input",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Pass paths through unchanged so a file manifest's relative VCF
+    # paths resolve against the manifest's directory; "-" becomes the
+    # standard input stream (relative paths then use the working dir).
+    manifest_source = sys.stdin if args.manifest == "-" else args.manifest
+    reference_source = sys.stdin if args.reference == "-" else args.reference
+
+    # Read and validate the manifest, every VCF and the reference
+    # completely, and build the full result, before touching the output:
+    # a failure never produces partial output or replaces an existing
+    # target.
+    try:
+        summaries = summarize_variants(manifest_source, reference_source)
+    except (
+        ManifestError,
+        VcfFormatError,
+        ReferenceMismatchError,
+        SequenceFormatError,
+        SequenceValidationError,
+    ) as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"{parser.prog}: {exc}", file=sys.stderr)
+        return 1
+
+    text = render_summaries(summaries)
+
+    if args.output == "-":
+        # Keep output byte-stable across platforms: no newline
+        # translation on standard output.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(newline="")
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    output_stream, temporary_path = _open_temporary_output(
+        args.output, parser, prefix=".summarize-variants-"
+    )
+    if output_stream is None:
+        return 1
+    try:
+        try:
+            output_stream.write(text)
+            output_stream.flush()
+            output_stream.close()
+            os.replace(temporary_path, args.output)
+        except OSError as exc:
+            _discard_temporary(output_stream, temporary_path)
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        if not output_stream.closed:
+            try:
+                output_stream.close()
+            except OSError:
+                pass
 
     return 0
 
