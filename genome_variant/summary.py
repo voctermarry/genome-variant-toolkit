@@ -31,12 +31,11 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from .sequence_io import SequenceRecord, read_sequences
+from . import _callsets
+from .sequence_io import SequenceRecord
 from .vcf import (
     VcfFormatError,
     VcfRecord,
-    _is_plain_allele,
-    normalize_vcf,
     read_vcf,
 )
 
@@ -49,9 +48,6 @@ __all__ = [
     "summarize_variants",
     "render_summaries",
 ]
-
-#: Genotypes accepted from the FORMAT/GT field, with allele contribution.
-_GENOTYPES = {"0/1": 1, "1/1": 2}
 
 
 class ManifestError(ValueError):
@@ -116,7 +112,7 @@ class SampleCall:
     @property
     def alleles(self) -> int:
         """Alt allele count for this genotype (``0/1`` -> 1, ``1/1`` -> 2)."""
-        return _GENOTYPES[self.gt]
+        return _callsets.GENOTYPE_ALLELES[self.gt]
 
 
 def read_manifest(
@@ -201,101 +197,57 @@ def read_manifest(
             stream.close()
 
 
-def _record_error(source: str, record: VcfRecord, message: str) -> ManifestError:
-    if source and record.line_number:
-        return ManifestError(f"{source}:{record.line_number}: {message}")
-    if record.line_number:
-        return ManifestError(f"line {record.line_number}: {message}")
-    return ManifestError(message)
-
-
-def _non_negative_int(text: str) -> int:
-    """Parse *text* as a non-negative integer without a sign or spaces."""
-    if not text or any(char < "0" or char > "9" for char in text):
-        raise ValueError("not a non-negative integer")
-    return int(text)
-
-
 def _validate_and_extract(
     record: VcfRecord, source: str
 ) -> tuple[str, int, tuple[int, int]]:
     """Validate one record and return ``(gt, dp, ad)`` from its sample text."""
-    if len(record.alt) != 1:
-        raise _record_error(
-            source,
-            record,
-            f"expected exactly one ALT allele, got {len(record.alt)}",
-        )
-    alt = record.alt[0]
-    if not _is_plain_allele(alt):
-        raise _record_error(
-            source, record, "ALT must be a single ordinary sequence allele"
-        )
-    if record.filter not in ("PASS", "."):
-        raise _record_error(
-            source, record, f"FILTER must be PASS or '.', got {record.filter!r}"
-        )
-    if record.format_text is None:
-        raise _record_error(source, record, "missing FORMAT column")
-
-    format_fields = record.format_text.split(":")
-    if len(format_fields) != len(set(format_fields)):
-        raise _record_error(source, record, "FORMAT contains duplicate field IDs")
-    required = ("GT", "DP", "AD")
-    missing = [field for field in required if field not in format_fields]
-    if missing:
-        raise _record_error(
-            source,
-            record,
-            "FORMAT must contain GT, DP and AD; missing " + ",".join(missing),
-        )
-
-    if len(record.sample_text) != 1:
-        raise _record_error(source, record, "expected one sample column")
-    values = record.sample_text[0].split(":")
-    if len(values) != len(format_fields):
-        raise _record_error(
-            source,
-            record,
-            f"sample has {len(values)} fields but FORMAT lists {len(format_fields)}",
-        )
-    data = dict(zip(format_fields, values))
-
-    gt = data["GT"]
-    if gt not in _GENOTYPES:
-        raise _record_error(
-            source, record, f"GT must be 0/1 or 1/1, got {gt!r}"
-        )
+    _callsets.validate_record(record, source, ManifestError)
+    data = _callsets.extract_sample_data(
+        record,
+        source,
+        ManifestError,
+        required=("GT", "DP", "AD"),
+        missing_message=lambda missing: (
+            "FORMAT must contain GT, DP and AD; missing " + ",".join(missing)
+        ),
+    )
+    gt = _callsets.extract_gt(data, record, source, ManifestError)
 
     try:
-        dp = _non_negative_int(data["DP"])
+        dp = _callsets.non_negative_int(data["DP"])
     except ValueError:
-        raise _record_error(
-            source, record, f"DP must be a non-negative integer, got {data['DP']!r}"
+        raise _callsets.record_error(
+            source,
+            record,
+            f"DP must be a non-negative integer, got {data['DP']!r}",
+            ManifestError,
         ) from None
 
     ad_fields = data["AD"].split(",")
     if len(ad_fields) != 2:
-        raise _record_error(
+        raise _callsets.record_error(
             source,
             record,
             f"AD must contain exactly two values, got {len(ad_fields)}",
+            ManifestError,
         )
     ad: list[int] = []
     for field in ad_fields:
         try:
-            ad.append(_non_negative_int(field))
+            ad.append(_callsets.non_negative_int(field))
         except ValueError:
-            raise _record_error(
+            raise _callsets.record_error(
                 source,
                 record,
                 f"AD values must be non-negative integers, got {field!r}",
+                ManifestError,
             ) from None
     if ad[0] + ad[1] != dp:
-        raise _record_error(
+        raise _callsets.record_error(
             source,
             record,
             f"AD values must sum to DP ({dp}), got {ad[0]}+{ad[1]}",
+            ManifestError,
         )
 
     return gt, dp, (ad[0], ad[1])
@@ -330,16 +282,11 @@ def summarize_variants(
     else:
         entries = tuple(manifest)
 
-    if isinstance(reference, (str, os.PathLike, io.IOBase)):
-        reference_records = tuple(read_sequences(reference, format="fasta"))
-    else:
-        reference_records = tuple(reference)
+    reference_records = _callsets.load_reference(reference)
 
     # Reference order for sorting.  Every record's CHROM is checked during
     # normalization, so a later lookup only sees present (and unique) CHROMs.
-    order: dict[str, int] = {}
-    for index, record in enumerate(reference_records):
-        order.setdefault(record.identifier, index)
+    order = _callsets.reference_order(reference_records)
 
     # key (chrom, pos, ref, alt) -> list of SampleCall in manifest order
     calls: dict[tuple[str, int, str, str], list[SampleCall]] = {}
@@ -353,15 +300,10 @@ def summarize_variants(
             raise ManifestError(str(exc)) from None
 
         # Single sample, named exactly as the manifest entry.
-        samples = document.header.samples
-        if len(samples) != 1:
+        sample = _callsets.single_sample(document, ManifestError)
+        if sample != entry.sample:
             raise ManifestError(
-                f"{source_label}:1: VCF must declare exactly one sample, "
-                f"got {len(samples)}"
-            )
-        if samples[0] != entry.sample:
-            raise ManifestError(
-                f"{source_label}:1: sample {samples[0]!r} does not match manifest "
+                f"{source_label}:1: sample {sample!r} does not match manifest "
                 f"sample {entry.sample!r}"
             )
 
@@ -373,17 +315,9 @@ def summarize_variants(
             _validate_and_extract(record, source_label) for record in document.records
         ]
 
-        normalized = normalize_vcf(document, reference_records)
+        keys = _callsets.normalized_keys(document, reference_records, ManifestError)
 
-        seen_keys: set[tuple[str, int, str, str]] = set()
-        for record, (gt, dp, ad) in zip(normalized.records, extracted):
-            key = (record.chrom, record.pos, record.ref, record.alt[0])
-            if key in seen_keys:
-                raise ManifestError(
-                    f"{source_label}:{record.line_number}: duplicate normalized "
-                    f"variant {record.chrom}:{record.pos}:{record.ref}>{record.alt[0]}"
-                )
-            seen_keys.add(key)
+        for key, (gt, dp, ad) in zip(keys, extracted):
             if key not in calls:
                 calls[key] = []
                 key_order.append(key)
