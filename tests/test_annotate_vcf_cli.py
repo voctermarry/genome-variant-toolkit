@@ -446,3 +446,67 @@ class TestAnnotateVcfCli:
         assert data_lines[1].endswith(
             "GVANN=<DEL>|UNSUPPORTED|MODIFIER|.|.|.|."
         )
+
+    def test_normalized_frameshift_insertion(self, reference_file, features_file) -> None:
+        # A normalized pure insertion: C inserted between coding
+        # positions 3 and 4 of ATG|AAA|TTT|GGG|CCC.
+        vcf = HEADER + COLUMNS + "chr1\t3\t.\tG\tGC\t.\t.\t.\n"
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features_file),
+            ],
+            vcf,
+        )
+        assert code == 0
+        assert err == ""
+        assert out.splitlines()[3] == (
+            "chr1\t3\t.\tG\tGC\t.\t.\t"
+            "GVANN=GC|FRAMESHIFT|HIGH|t1|4|.|."
+        )
+
+    def test_inframe_deletion_is_moderate(self, reference_file, features_file) -> None:
+        # In-frame deletion of codon AAA (coding positions 4-6).
+        vcf = HEADER + COLUMNS + "chr1\t3\t.\tGAAA\tG\t.\t.\t.\n"
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features_file),
+            ],
+            vcf,
+        )
+        assert code == 0
+        assert err == ""
+        assert out.splitlines()[3] == (
+            "chr1\t3\t.\tGAAA\tG\t.\t.\t"
+            "GVANN=G|INFRAME_DELETION|MODERATE|t1|4|.|."
+        )
+
+    def test_cross_fragment_indel_exit_0_with_unsupported(
+        self, tmp_path, reference_file
+    ) -> None:
+        # Two CDS fragments meeting at coding positions 9/10; a
+        # boundary-spanning insertion is UNSUPPORTED, not an error.
+        features = tmp_path / "split.gff3"
+        features.write_text(
+            "chr1\ttest\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+            "chr1\ttest\tCDS\t10\t15\t.\t+\t0\tParent=t1\n"
+        )
+        vcf = HEADER + COLUMNS + "chr1\t9\t.\tT\tTC\t.\t.\t.\n"
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features),
+            ],
+            vcf,
+        )
+        assert code == 0
+        assert err == ""
+        assert out.splitlines()[3] == (
+            "chr1\t9\t.\tT\tTC\t.\t.\t"
+            "GVANN=TC|UNSUPPORTED|MODIFIER|t1|.|.|."
+        )
+

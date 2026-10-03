@@ -10,11 +10,16 @@ Public API:
   every record of a :class:`~genome_variant.vcf.VcfFile`.
 
 CDS features are grouped by their GFF3 ``Parent`` attribute into
-transcripts.  The standard genetic code is used; only ``A``/``C``/``G``/``T``
+transcripts.  The standard genetic code is used.  ``A``/``C``/``G``/``T``
 single-base substitutions inside a CDS are annotated with a coding
-consequence.  Every other ALT (indels, ambiguous or symbolic alleles)
-receives ``UNSUPPORTED``/``MODIFIER`` and records without a CDS hit
-receive ``NON_CODING``/``MODIFIER``.
+consequence, and pure ``A``/``C``/``G``/``T`` insertions and deletions
+are annotated as ``FRAMESHIFT`` (length change not a multiple of three,
+``HIGH``) or ``INFRAME_INSERTION``/``INFRAME_DELETION`` (``MODERATE``)
+when the event lies inside one contiguous CDS fragment.  Every other ALT
+(complex replacements, ambiguous or symbolic alleles, indels that cross
+CDS fragment boundaries or miss a coding anchor) receives
+``UNSUPPORTED``/``MODIFIER`` and records without a CDS hit receive
+``NON_CODING``/``MODIFIER``.
 """
 
 from __future__ import annotations
@@ -71,8 +76,11 @@ _CONSEQUENCE_IMPACT = {
     "START_LOST": "HIGH",
     "STOP_GAINED": "HIGH",
     "STOP_LOST": "HIGH",
+    "FRAMESHIFT": "HIGH",
     "SYNONYMOUS": "LOW",
     "MISSENSE": "MODERATE",
+    "INFRAME_DELETION": "MODERATE",
+    "INFRAME_INSERTION": "MODERATE",
 }
 
 _GVANN_HEADER = (
@@ -119,6 +127,8 @@ class _Transcript:
     seqid: str
     #: Genomic 0-based index -> coding site, for bases in complete codons.
     sites: dict[int, _CodonSite]
+    #: Genomic 0-based index -> 1-based coding position, every CDS base.
+    coding_positions: dict[int, int]
     #: Original fragments as (1-based start, 1-based end, source line).
     fragments: tuple[tuple[int, int, int], ...]
 
@@ -338,11 +348,18 @@ def _build_transcript(
                 position_in_codon=position_in_codon,
                 codon_indices=codon_indices,
             )
+
+    coding_positions = {
+        genomic_index: cds_pos
+        for cds_pos, genomic_index in enumerate(layout, start=1)
+    }
+
     return _Transcript(
         parent=parent,
         strand=fragments[0].strand,
         seqid=fragments[0].seqid,
         sites=sites,
+        coding_positions=coding_positions,
         fragments=tuple(
             sorted(
                 (fragment.start, fragment.end, fragment.line_number)
@@ -408,6 +425,54 @@ def _is_acgt_snv(ref: str, alt: str) -> bool:
     )
 
 
+def _is_acgt(text: str) -> bool:
+    return bool(text) and all(base in "ACGT" for base in text)
+
+
+def _trim_alleles(ref: str, alt: str) -> tuple[int, int, str, str]:
+    """Remove the longest common prefix, then suffix, of REF and ALT.
+
+    Returns ``(prefix_length, suffix_length, ref_remainder, alt_remainder)``.
+    The prefix is stripped first so the shared VCF anchor base stays on
+    the left; the suffix is then measured on the remainders, never
+    re-using a prefix base.
+    """
+    limit = min(len(ref), len(alt))
+    prefix = 0
+    while prefix < limit and ref[prefix] == alt[prefix]:
+        prefix += 1
+    ref_remainder = ref[prefix:]
+    alt_remainder = alt[prefix:]
+    suffix = 0
+    while (
+        suffix < len(ref_remainder)
+        and suffix < len(alt_remainder)
+        and ref_remainder[-1 - suffix] == alt_remainder[-1 - suffix]
+    ):
+        suffix += 1
+    if suffix:
+        ref_remainder = ref_remainder[:-suffix]
+        alt_remainder = alt_remainder[:-suffix]
+    return prefix, suffix, ref_remainder, alt_remainder
+
+
+def _indel_kind(ref: str, alt: str) -> tuple[str, int, int] | None:
+    """Classify a pure ACGT ALT as ``"deletion"``/``"insertion"``.
+
+    Returns ``(kind, prefix_length, suffix_length)`` or ``None`` for a
+    complex replacement (remainders on both sides), a no-op allele or an
+    allele carrying non-ACGT symbols.
+    """
+    if not _is_acgt(ref) or not _is_acgt(alt):
+        return None
+    prefix, suffix, ref_remainder, alt_remainder = _trim_alleles(ref, alt)
+    if ref_remainder and not alt_remainder:
+        return "deletion", prefix, suffix
+    if alt_remainder and not ref_remainder:
+        return "insertion", prefix, suffix
+    return None
+
+
 def _classify(codon_number: int, old_codon: str, new_codon: str) -> tuple[str, str]:
     old_aa = _GENETIC_CODE[old_codon]
     new_aa = _GENETIC_CODE[new_codon]
@@ -424,17 +489,124 @@ def _classify(codon_number: int, old_codon: str, new_codon: str) -> tuple[str, s
     return consequence, _CONSEQUENCE_IMPACT[consequence]
 
 
+def _fragment_containing(
+    transcript: _Transcript, start: int, end: int
+) -> tuple[int, int, int] | None:
+    """The unique CDS fragment covering the 1-based inclusive interval.
+
+    ``None`` when no fragment covers it or more than one does (overlapping
+    fragments or an interval straddling a fragment boundary).
+    """
+    matches = [
+        fragment
+        for fragment in transcript.fragments
+        if fragment[0] <= start and end <= fragment[1]
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _annotate_indel_transcript(
+    record: VcfRecord,
+    alt: str,
+    kind: str,
+    prefix: int,
+    suffix: int,
+    transcript: _Transcript,
+) -> str | None:
+    """Annotate one pure ACGT indel against one transcript.
+
+    Returns the transcript's GVANN item (``FRAMESHIFT``/``HIGH`` or
+    ``INFRAME_*``/``MODERATE`` on success, ``UNSUPPORTED``/``MODIFIER``
+    when the event touches the CDS but cannot be judged), or ``None``
+    when the event never touches this transcript's CDS.
+    """
+    unsupported = f"{alt}|UNSUPPORTED|MODIFIER|{transcript.parent}|.|.|."
+
+    if kind == "deletion":
+        # The deleted bases follow the shared anchor (record POS plus the
+        # stripped common prefix) and exclude the trailing common base.
+        length = len(record.ref) - prefix - suffix
+        start_index = record.pos - 1 + prefix
+        positions = [
+            transcript.coding_positions.get(index)
+            for index in range(start_index, start_index + length)
+        ]
+        if all(position is None for position in positions):
+            return None
+        if any(position is None for position in positions):
+            # Part of the deleted interval is outside every CDS fragment.
+            return unsupported
+        # The whole deletion must fall inside one CDS fragment.
+        if _fragment_containing(
+            transcript, start_index + 1, start_index + length
+        ) is None:
+            return unsupported
+        # ...and the deleted bases must be consecutive in coding order.
+        first = min(positions)
+        if sorted(positions) != list(range(first, first + length)):
+            return unsupported
+        cds_pos = first
+        consequence = "FRAMESHIFT" if length % 3 else "INFRAME_DELETION"
+    else:
+        # The inserted bases sit between the last shared-prefix base and
+        # the next genomic base (which is the first suffix base when a
+        # shared suffix exists, since prefix plus suffix exhaust REF):
+        # genomic 0-based indices L and R.
+        length = len(alt) - prefix - suffix
+        left_index = record.pos - 2 + prefix
+        right_index = record.pos - 1 + prefix
+        left_position = transcript.coding_positions.get(left_index)
+        right_position = transcript.coding_positions.get(right_index)
+        if left_position is None and right_position is None:
+            return None
+        if left_position is None or right_position is None:
+            # One coding anchor base is missing (outside the CDS).
+            return unsupported
+        # Both flanking bases must live in the same CDS fragment.
+        if _fragment_containing(
+            transcript, left_index + 1, right_index + 1
+        ) is None:
+            return unsupported
+        # They must be adjacent in the assembled coding sequence; the
+        # reported position is the downstream one in coding direction,
+        # which is strand independent.
+        if abs(right_position - left_position) != 1:
+            return unsupported
+        cds_pos = max(left_position, right_position)
+        consequence = "FRAMESHIFT" if length % 3 else "INFRAME_INSERTION"
+
+    impact = "HIGH" if consequence == "FRAMESHIFT" else "MODERATE"
+    return f"{alt}|{consequence}|{impact}|{transcript.parent}|{cds_pos}|.|."
+
+
 def _annotate_alt(
     record: VcfRecord,
     alt: str,
     transcripts: tuple[_Transcript, ...],
     chromosome: str,
 ) -> str:
+    indel = _indel_kind(record.ref, alt)
+    if indel is not None:
+        kind, prefix, suffix = indel
+        items: list[str] = []
+        # transcripts are already ordered by Parent, so hits stay lexicographic.
+        for transcript in transcripts:
+            if transcript.seqid != record.chrom:
+                continue
+            item = _annotate_indel_transcript(
+                record, alt, kind, prefix, suffix, transcript
+            )
+            if item is not None:
+                items.append(item)
+        if not items:
+            return f"{alt}|NON_CODING|MODIFIER|{_NO_TRANSCRIPT}"
+        return ",".join(items)
+
     if not _is_acgt_snv(record.ref, alt):
         return f"{alt}|UNSUPPORTED|MODIFIER|{_NO_TRANSCRIPT}"
 
     genomic_index = record.pos - 1
-    items: list[str] = []
+    items = []
     # transcripts are already ordered by Parent, so hits stay lexicographic.
     for transcript in transcripts:
         if transcript.seqid != record.chrom:
@@ -537,12 +709,25 @@ def annotate_vcf(
     preserved; one unique ``##INFO`` declaration for ``GVANN`` is
     appended to the meta-information and a ``GVANN`` item is appended to
     the end of each record's INFO column (starting the column when INFO
-    was missing).  Coding consequences are ``START_LOST``,
+    was missing).  Coding SNV consequences are ``START_LOST``,
     ``STOP_GAINED``, ``STOP_LOST``, ``SYNONYMOUS`` and ``MISSENSE`` with
-    impacts ``HIGH``, ``HIGH``, ``HIGH``, ``LOW`` and ``MODERATE``;
-    transcripts are listed by lexicographic Parent.  SNVs outside every
-    CDS get ``NON_CODING``/``MODIFIER`` and non-SNV, ambiguous or
-    symbolic ALTs get ``UNSUPPORTED``/``MODIFIER``.
+    impacts ``HIGH``, ``HIGH``, ``HIGH``, ``LOW`` and ``MODERATE``.  A
+    pure ``A``/``C``/``G``/``T`` insertion or deletion whose longest
+    common REF/ALT prefix and suffix trim to a single event is judged per
+    Parent: wholly within one CDS fragment, with the deleted bases (or
+    the insertion's two flanking bases) consecutive in the assembled
+    coding sequence, it is ``FRAMESHIFT``/``HIGH`` when the length change
+    is not a multiple of three and otherwise
+    ``INFRAME_DELETION``/``INFRAME_INSERTION`` with ``MODERATE``;
+    ``CDS_POS`` is the first affected coding position (the downstream
+    base for an insertion) and ``CODON_CHANGE``/``AA_CHANGE`` are ``.``.
+    An indel that touches a CDS across fragment boundaries, over
+    non-coding bases or without a coding anchor on both sides gets
+    ``UNSUPPORTED``/``MODIFIER`` for that transcript.  Transcripts are
+    listed by lexicographic Parent.  Variants outside every CDS get
+    ``NON_CODING``/``MODIFIER``; complex replacements (remainders on both
+    sides) and ambiguous, symbolic, break-end, spanning or missing ALTs
+    get ``UNSUPPORTED``/``MODIFIER``.
 
     Every record's REF is checked against the reference first.  Raises
     :class:`~genome_variant.vcf.ReferenceMismatchError` for an
