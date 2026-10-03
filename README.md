@@ -2,7 +2,7 @@
 
 本项目是「基因组变异分析工具链」的代码仓库，用于逐步实现该方向的序列处理、比对与变异分析能力。
 
-当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV 变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
+当前版本提供 FASTA/FASTQ 序列的读取、校验与规范化、读段质量过滤、k-mer 索引、成对序列比对、多参考多读段的确定性映射、单样本 SNV（可选短插入/短缺失）变异调用、参考序列感知的 VCF 规范化以及基于 GFF3 CDS 的 VCF 变异注释与影响分级功能。
 
 ## 环境与安装
 
@@ -132,15 +132,18 @@ genome-variant-toolkit call-variants REFERENCE READS \
     [--min-base-quality N] [--min-alt-count N] \
     [--min-alt-fraction F] [--homozygous-fraction F] \
     [--sample-name NAME] \
+    [--call-indels] [--max-indel-length N] \
     [--output OUTPUT]
 ```
 
 - `REFERENCE` 按 FASTA 解析且可含多条参考记录（标识不得重复，集合不得为空）；`READS` 默认自动识别（可用 `--reads-format` 指定），必须携带质量值。两者与 `--output` 为 `-` 时沿用标准流约定（输出默认标准输出），但两个输入不能同时为标准输入。
-- 本次仅调用 `A`、`C`、`G`、`T` 之间的替换；插入、缺失、未对齐部分、未映射读段与歧义碱基（参考或观测碱基非 `ACGT`）均忽略。每条已映射读段在同一参考位置最多贡献一次观测；负链证据按参考正链方向报告观测碱基，质量值对应回原读段位置。
+- 默认仅调用 `A`、`C`、`G`、`T` 之间的替换；插入、缺失、未对齐部分、未映射读段与歧义碱基（参考或观测碱基非 `ACGT`）均忽略。每条已映射读段在同一参考位置最多贡献一次观测；负链证据按参考正链方向报告观测碱基，质量值对应回原读段位置。
+- `--call-indels`（默认关闭）：额外调用短插入与短缺失。只从胜出比对的连续 `I`、`D` CIGAR 片段提取事件；插入以左侧参考碱基加插入序列表示，缺失以左锚点加被删除参考片段表示。无可用左锚点、缺少左右任一已对齐读段碱基、任一相关参考或插入碱基非 `ACGT`、或长度超过 `--max-indel-length` 的事件一律忽略。插入证据要求两侧及全部插入碱基质量达标，缺失证据要求两侧碱基质量达标（负链质量换算回原读段坐标）。候选先按参考感知规则最简化并左对齐，再按 `CHROM`、`POS`、`REF`、`ALT` 合并等价事件；事件的 `DP` 为同时跨过其左右边界、两侧质量达标且未在该边界产生其他插入或缺失的已映射读段数，`AC` 为其中支持该事件的读段数，其余阈值与 SNV 相同，`AD` 为 `DP-AC,AC`。
+- `--max-indel-length`（默认 50，正整数）：可调用的最长插入/缺失碱基数；必须与 `--call-indels` 同用，单独给出或数值非法均为参数错误。
 - `--min-base-quality`（默认 20，0 至 93 的非布尔整数）：只接纳 Phred 不低于该值的碱基；`DP` 为通过门槛的 `ACGT` 观测总数。
 - `--min-alt-count`（默认 2，正整数）与 `--min-alt-fraction`（默认 0.2，0 至 1 的有限数）：非参考碱基中计数最高者为唯一 ALT，并列时按 `A`、`C`、`G`、`T` 选择；ALT 计数达到门槛且 `AC/DP` 不低于最小比例才输出。
 - `--homozygous-fraction`（默认 0.8，0 至 1 的有限数，且不得低于 `--min-alt-fraction`）：ALT 比例不低于该值时 GT 为 `1/1`，否则为 `0/1`。
-- 输出记录按参考输入次序、再按 POS 升序排列；`REF`、`ALT` 大写，`ID` 为 `.`，`QUAL` 为点，`FILTER` 为 `PASS`；`INFO` 为 `DP`、`AC`、`AF`（`AF` 固定六位小数），`FORMAT` 为 `GT:DP:AD`，`AD` 为参考与所选 ALT 的计数，样本名默认 `SAMPLE`（`--sample-name` 覆盖，不得为空、纯空白或含制表符）。
+- 输出记录按参考输入次序、再按 `POS`、`REF`、`ALT` 升序排列（同一位置的多个合格 indel 分别成行）；`REF`、`ALT` 大写，`ID` 为 `.`，`QUAL` 为点，`FILTER` 为 `PASS`；`INFO` 为 `DP`、`AC`、`AF`（`AF` 固定六位小数），`FORMAT` 为 `GT:DP:AD`，`AD` 为参考与所选 ALT 的计数，样本名默认 `SAMPLE`（`--sample-name` 覆盖，不得为空、纯空白或含制表符）。
 - 无候选时仍输出完整头部（7 行 `##` 元信息加 `#CHROM` 列头）。写文件时仅在全部读取与调用成功后经同目录临时文件原子替换，失败保留原目标；读段分批不影响逐字节结果。
 - 返回码：成功 `0`；参数错误、非法阈值（在消费输入前报错）、空参考、重复参考标识、非法样本名、缺少质量或质量长度错误、FASTQ 与序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
 
@@ -229,7 +232,7 @@ genome-variant-toolkit annotate-vcf INPUT --reference REFERENCE --features FEATU
 模块 `genome_variant.calling` 提供：
 
 - `VariantCallingError`（`ValueError` 子类）：参考集合为空、参考标识重复或样本名为空、纯空白、含制表符（或非字符串）时抛出。
-- `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE")`：返回可由 `read_vcf` 读回的 `VcfFile`（VCFv4.2，单样本）。映射与 `map_reads` 使用相同的局部比对计分（固定默认值）、正反链搜索与候选裁决；质量不参与映射，只过滤碱基证据。仅统计参考碱基与观测碱基都属于 `ACGT` 的比对列，插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；每条已映射读段在同一参考位置至多贡献一次观测，负链观测碱基按参考正链报告而质量取自原读段对应位置。`DP` 为通过质量门槛的 `ACGT` 观测总数，唯一 ALT 为非参考碱基中计数最高者（并列按 `A`、`C`、`G`、`T`），ALT 计数至少 `min_alt_count` 且 `AC/DP` 至少 `min_alt_fraction` 才输出记录；比例不低于 `homozygous_fraction` 时 GT 为 `1/1`，否则 `0/1`。记录按参考输入次序与 POS 升序排列，`INFO` 为 `DP`、`AC`、`AF`（六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 限于 0 至 93 的非布尔整数，`min_alt_count` 为非布尔正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例；非法阈值在消费任一输入前抛出 `ValueError`，样本名与参考错误抛出 `VariantCallingError`，读段缺少质量、质量长度错误或质量越界在迭代到该读段时抛出 `ReadQualityError`。
+- `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE", call_indels=False, max_indel_length=50)`：返回可由 `read_vcf` 读回的 `VcfFile`（VCFv4.2，单样本）。映射与 `map_reads` 使用相同的局部比对计分（固定默认值）、正反链搜索与候选裁决；质量不参与映射，只过滤碱基证据。仅统计参考碱基与观测碱基都属于 `ACGT` 的比对列，插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；每条已映射读段在同一参考位置至多贡献一次观测，负链观测碱基按参考正链报告而质量取自原读段对应位置。`DP` 为通过质量门槛的 `ACGT` 观测总数，唯一 ALT 为非参考碱基中计数最高者（并列按 `A`、`C`、`G`、`T`），ALT 计数至少 `min_alt_count` 且 `AC/DP` 至少 `min_alt_fraction` 才输出记录；比例不低于 `homozygous_fraction` 时 GT 为 `1/1`，否则 `0/1`。`call_indels` 为真时额外从胜出比对的连续 `I`、`D` CIGAR 片段调用短插入/短缺失：插入以左侧参考碱基加插入序列、缺失以左锚点加被删除参考片段表示；无左锚点、缺少任一侧已对齐读段碱基、相关参考或插入碱基非 `ACGT`、或长度超过 `max_indel_length` 的事件忽略；插入证据要求两侧及全部插入碱基质量达标，缺失证据要求两侧碱基质量达标。候选经参考感知的最简化与左对齐后按 `CHROM`、`POS`、`REF`、`ALT` 合并；事件 `DP` 为同时跨过左右边界、两侧质量达标且未在该边界产生其他插入或缺失的已映射读段数，`AC` 为其中支持该事件的读段数，`AD` 为 `DP-AC,AC`。记录按参考输入次序、`POS`、`REF`、`ALT` 排列，`INFO` 为 `DP`、`AC`、`AF`（六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 限于 0 至 93 的非布尔整数，`min_alt_count` 与 `max_indel_length` 为非布尔正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例；非法阈值在消费任一输入前抛出 `ValueError`，样本名与参考错误抛出 `VariantCallingError`，读段缺少质量、质量长度错误或质量越界在迭代到该读段时抛出 `ReadQualityError`。
 
 模块 `genome_variant.coverage` 提供：
 

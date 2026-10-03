@@ -434,6 +434,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="sample name written to the #CHROM header (default: SAMPLE)",
     )
     call_variants_cmd.add_argument(
+        "--call-indels",
+        action="store_true",
+        help="also call short insertions and deletions from the winning "
+        "alignments (default: SNVs only)",
+    )
+    call_variants_cmd.add_argument(
+        "--max-indel-length",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="longest insertion or deletion to call, a positive integer "
+        "(default: 50); requires --call-indels",
+    )
+    call_variants_cmd.add_argument(
         "--output",
         default="-",
         help="output file, or '-' for standard output (default: standard output)",
@@ -1283,6 +1297,13 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
         )
         return 2
 
+    if args.max_indel_length is not None and not args.call_indels:
+        print(
+            f"{parser.prog}: --max-indel-length requires --call-indels",
+            file=sys.stderr,
+        )
+        return 2
+
     ref_stream, close_ref, ref_code = _open_input(args.reference, parser)
     if ref_stream is None:
         return ref_code
@@ -1323,6 +1344,10 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
                 min_alt_fraction=args.min_alt_fraction,
                 homozygous_fraction=args.homozygous_fraction,
                 sample_name=args.sample_name,
+                call_indels=args.call_indels,
+                max_indel_length=(
+                    50 if args.max_indel_length is None else args.max_indel_length
+                ),
             )
             text = render_vcf(document)
         except (

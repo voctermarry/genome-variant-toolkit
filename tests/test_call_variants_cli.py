@@ -394,3 +394,114 @@ class TestCallVariantsOutput:
         code, out, err = run([])
         assert code == 0
         assert "call-variants" in out
+
+
+# Non-repetitive reference; INS_READ carries a "TT" insertion after POS 15.
+INDEL_REFERENCE = ">c1\nACGATCGTACGGATCCGTAGCTAACCGGTTAC\n"
+INDEL_REF_READ = "ACGATCGTACGGATCCGTAGCTAACCGGTTAC"
+INDEL_INS_READ = "ACGATCGTACGGATCTTCGTAGCTAACCGGTTAC"
+EXPECTED_INS_RECORD = (
+    "c1\t15\t.\tC\tCTT\t.\tPASS\tDP=4;AC=3;AF=0.750000\tGT:DP:AD\t0/1:4:1,3"
+)
+
+
+def indel_reads(tmp_path):
+    reference = write(tmp_path, "r.fa", INDEL_REFERENCE)
+    reads = write(
+        tmp_path,
+        "q.fq",
+        fastq("a", INDEL_INS_READ)
+        + fastq("b", INDEL_INS_READ)
+        + fastq("c", INDEL_INS_READ)
+        + fastq("w", INDEL_REF_READ),
+    )
+    return reference, reads
+
+
+class TestCallVariantsIndels:
+    def test_indels_off_by_default(self, tmp_path) -> None:
+        reference, reads = indel_reads(tmp_path)
+        code, out, err = run(["call-variants", str(reference), str(reads)])
+        assert code == 0
+        assert err == ""
+        assert [line for line in out.splitlines() if not line.startswith("#")] == []
+
+    def test_call_indels_reports_insertion(self, tmp_path) -> None:
+        reference, reads = indel_reads(tmp_path)
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--call-indels"]
+        )
+        assert code == 0
+        assert err == ""
+        rows = [line for line in out.splitlines() if not line.startswith("#")]
+        assert rows == [EXPECTED_INS_RECORD]
+
+    def test_max_indel_length_limits_events(self, tmp_path) -> None:
+        reference, reads = indel_reads(tmp_path)
+        code, out, err = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--max-indel-length",
+                "1",
+            ]
+        )
+        assert code == 0
+        assert [line for line in out.splitlines() if not line.startswith("#")] == []
+        code, out, err = run(
+            [
+                "call-variants",
+                str(reference),
+                str(reads),
+                "--call-indels",
+                "--max-indel-length",
+                "2",
+            ]
+        )
+        assert code == 0
+        rows = [line for line in out.splitlines() if not line.startswith("#")]
+        assert rows == [EXPECTED_INS_RECORD]
+
+    def test_max_indel_length_requires_call_indels(self, tmp_path) -> None:
+        reference, reads = indel_reads(tmp_path)
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--max-indel-length", "30"]
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+
+    def test_bad_max_indel_length_exit_2(self, tmp_path) -> None:
+        reference, reads = indel_reads(tmp_path)
+        for value in ("0", "-1", "1.5", "x"):
+            code, out, err = run(
+                [
+                    "call-variants",
+                    str(reference),
+                    str(reads),
+                    "--call-indels",
+                    "--max-indel-length",
+                    value,
+                ]
+            )
+            assert code == 2, value
+            assert out == "", value
+            assert err.count("\n") == 1, value
+
+    def test_indel_output_round_trips_through_normalize_vcf(self, tmp_path) -> None:
+        from genome_variant.sequence_io import read_sequences
+        from genome_variant.vcf import normalize_vcf, read_vcf, render_vcf
+        from io import StringIO
+
+        reference, reads = indel_reads(tmp_path)
+        code, out, err = run(
+            ["call-variants", str(reference), str(reads), "--call-indels"]
+        )
+        assert code == 0
+        with open(reference) as stream:
+            references = list(read_sequences(stream, format="fasta"))
+        document = read_vcf(StringIO(out))
+        assert len(document.records) == 1
+        assert render_vcf(normalize_vcf(document, references)) == out

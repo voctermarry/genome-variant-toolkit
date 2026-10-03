@@ -10,7 +10,7 @@ import pytest
 from genome_variant.calling import VariantCallingError, call_variants
 from genome_variant.quality import ReadQualityError
 from genome_variant.sequence_io import SequenceRecord
-from genome_variant.vcf import read_vcf, render_vcf
+from genome_variant.vcf import normalize_vcf, read_vcf, render_vcf
 
 
 def rec(identifier, sequence, quality=None):
@@ -318,6 +318,11 @@ class TestValidation:
             {"min_alt_fraction": True},
             {"homozygous_fraction": -0.1},
             {"homozygous_fraction": math.nan},
+            {"max_indel_length": 0},
+            {"max_indel_length": -3},
+            {"max_indel_length": True},
+            {"max_indel_length": 2.5},
+            {"max_indel_length": "50"},
         ],
     )
     def test_invalid_thresholds_raise_before_consumption(self, kwargs) -> None:
@@ -403,5 +408,312 @@ class TestOutput:
         first = render_vcf(call_variants(list(refs), list(read_list)))
         second = render_vcf(
             call_variants(iter(list(refs)), iter(list(read_list)))
+        )
+        assert first == second
+
+
+# A non-repetitive reference; the insertion of "TT" and the deletion of
+# the "CG" at zero-based positions 15-16 both left-anchor on the "C" at
+# position 14 (POS 15).
+INDEL_REF = "ACGATCGTACGGATCCGTAGCTAACCGGTTAC"
+
+
+def ins_read(identifier, inserted="TT", quality=40):
+    sequence = INDEL_REF[:15] + inserted + INDEL_REF[15:]
+    if isinstance(quality, int):
+        quality = quals(len(sequence), quality)
+    return rec(identifier, sequence, quality)
+
+
+def del_read(identifier, quality=40):
+    sequence = INDEL_REF[:15] + INDEL_REF[17:]
+    if isinstance(quality, int):
+        quality = quals(len(sequence), quality)
+    return rec(identifier, sequence, quality)
+
+
+def reverse_complement(sequence):
+    return sequence.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+
+class TestIndelCalls:
+    def test_disabled_by_default(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read("a"), ins_read("b"), fq("w", INDEL_REF)]
+        assert call_variants(refs, reads).records == ()
+        assert call_variants(refs, reads, call_indels=False).records == ()
+
+    def test_insertion_called(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read("a"), ins_read("b"), ins_read("c"), fq("w", INDEL_REF)]
+        document = call_variants(refs, reads, call_indels=True)
+        assert fields(document) == [
+            (
+                "c1",
+                15,
+                "C",
+                "CTT",
+                ".",
+                "PASS",
+                "DP=4;AC=3;AF=0.750000",
+                "GT:DP:AD",
+                "0/1:4:1,3",
+            )
+        ]
+
+    def test_deletion_called(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [del_read("a"), del_read("b"), fq("w", INDEL_REF)]
+        document = call_variants(refs, reads, call_indels=True)
+        assert fields(document) == [
+            (
+                "c1",
+                15,
+                "CCG",
+                "C",
+                ".",
+                "PASS",
+                "DP=3;AC=2;AF=0.666667",
+                "GT:DP:AD",
+                "0/1:3:1,2",
+            )
+        ]
+
+    def test_homozygous_insertion(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read(str(i)) for i in range(3)]
+        document = call_variants(refs, reads, call_indels=True)
+        record = document.records[0]
+        assert record.info == "DP=3;AC=3;AF=1.000000"
+        assert record.sample_text == ("1/1:3:0,3",)
+
+    def test_reverse_strand_indel_evidence(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        sequence = ins_read("x").sequence
+        reads = [
+            fq("a", sequence),
+            fq("b", reverse_complement(sequence)),
+            fq("c", reverse_complement(sequence)),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        assert fields(document)[0][1:4] == (15, "C", "CTT")
+        assert document.records[0].info == "DP=4;AC=3;AF=0.750000"
+
+    def test_reverse_strand_quality_maps_to_original_read(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        sequence = ins_read("x").sequence
+        # The inserted bases sit at query indices 15 and 16 of the aligned
+        # reverse complement; convert to original-read coordinates.
+        quality = [40] * len(sequence)
+        quality[len(sequence) - 1 - 15] = 5
+        quality[len(sequence) - 1 - 16] = 5
+        reads = [
+            ins_read("a"),
+            ins_read("b"),
+            rec("c", reverse_complement(sequence), tuple(quality)),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        # Read c still spans the boundary with good flanks (DP) but its
+        # inserted bases fail the quality floor (no ALT evidence).
+        assert document.records[0].info == "DP=4;AC=2;AF=0.500000"
+        assert document.records[0].sample_text == ("0/1:4:2,2",)
+
+    def test_inserted_base_quality_required(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        quality = [40] * len(ins_read("x").sequence)
+        quality[15] = 5  # first inserted base
+        reads = [
+            ins_read("a"),
+            ins_read("b"),
+            ins_read("c", quality=tuple(quality)),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        assert document.records[0].info == "DP=4;AC=2;AF=0.500000"
+
+    def test_flanking_base_quality_required(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        quality = [40] * len(ins_read("x").sequence)
+        quality[14] = 5  # left flanking read base
+        reads = [
+            ins_read("a"),
+            ins_read("b"),
+            ins_read("c", quality=tuple(quality)),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        # The low-quality flank excludes the read from DP as well.
+        assert document.records[0].info == "DP=3;AC=2;AF=0.666667"
+
+    def test_conflicting_indel_excluded_from_depth(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [
+            ins_read("a", "TT"),
+            ins_read("b", "TT"),
+            ins_read("c", "G"),
+            ins_read("d", "G"),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        # Each event's DP counts its own reads plus the indel-free read;
+        # reads carrying the other insertion at the same boundary are
+        # excluded.  Records sort by ALT within the shared POS.
+        assert fields(document) == [
+            (
+                "c1",
+                15,
+                "C",
+                "CG",
+                ".",
+                "PASS",
+                "DP=3;AC=2;AF=0.666667",
+                "GT:DP:AD",
+                "0/1:3:1,2",
+            ),
+            (
+                "c1",
+                15,
+                "C",
+                "CTT",
+                ".",
+                "PASS",
+                "DP=3;AC=2;AF=0.666667",
+                "GT:DP:AD",
+                "0/1:3:1,2",
+            ),
+        ]
+
+    def test_left_alignment_merges_equivalent_events(self) -> None:
+        # The same insertion into the A-run, produced at different raw
+        # positions by reads of different lengths, normalizes to one
+        # left-aligned event.
+        refs = [rec("c2", "ACGTACAAAATCGAC")]
+        reference = "ACGTACAAAATCGAC"
+        reads = [
+            fq("a", reference[0:6] + "A" + reference[6:15]),
+            fq("b", reference[2:10] + "A" + reference[10:15]),
+            fq("c", reference[1:8] + "A" + reference[8:14]),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        assert fields(document) == [
+            (
+                "c2",
+                6,
+                "C",
+                "CA",
+                ".",
+                "PASS",
+                "DP=3;AC=3;AF=1.000000",
+                "GT:DP:AD",
+                "1/1:3:0,3",
+            )
+        ]
+
+    def test_max_indel_length_filters_long_events(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [
+            ins_read("a", "TTTTTT"),
+            ins_read("b", "TTTTTT"),
+            fq("w", INDEL_REF),
+        ]
+        assert (
+            call_variants(refs, reads, call_indels=True, max_indel_length=5).records
+            == ()
+        )
+        document = call_variants(refs, reads, call_indels=True, max_indel_length=6)
+        assert document.records[0].alt == ("CTTTTTT",)
+
+    def test_non_acgt_insertion_ignored(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read("a", "NN"), ins_read("b", "NN")]
+        assert call_variants(refs, reads, call_indels=True).records == ()
+
+    def test_deletion_over_ambiguous_reference_ignored(self) -> None:
+        # The deleted fragment contains an N.
+        refs = [rec("c1", INDEL_REF[:15] + "N" + INDEL_REF[16:])]
+        reads = [del_read("a"), del_read("b")]
+        assert call_variants(refs, reads, call_indels=True).records == ()
+
+    def test_deletion_with_ambiguous_anchor_ignored(self) -> None:
+        # The left anchor base is an N.
+        ambiguous = INDEL_REF[:14] + "N" + INDEL_REF[15:]
+        refs = [rec("c1", ambiguous)]
+        sequence = ambiguous[:15] + ambiguous[17:]
+        reads = [fq("a", sequence), fq("b", sequence)]
+        assert call_variants(refs, reads, call_indels=True).records == ()
+
+    def test_thresholds_apply_to_indels(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read("a"), ins_read("b"), ins_read("c"), fq("w", INDEL_REF)]
+        assert (
+            call_variants(refs, reads, call_indels=True, min_alt_count=4).records
+            == ()
+        )
+        assert (
+            call_variants(
+                refs,
+                reads,
+                call_indels=True,
+                min_alt_fraction=0.9,
+                homozygous_fraction=0.9,
+            ).records
+            == ()
+        )
+
+    def test_snv_and_indels_share_position_and_sort(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        snv = INDEL_REF[:14] + "A" + INDEL_REF[15:]
+        reads = [
+            ins_read("a", "TT"),
+            ins_read("b", "TT"),
+            ins_read("c", "G"),
+            ins_read("d", "G"),
+            fq("e", snv),
+            fq("f", snv),
+            fq("w", INDEL_REF),
+        ]
+        document = call_variants(refs, reads, call_indels=True)
+        # SNV first (ALT "A"), then the two insertions by ALT; each
+        # indel's DP excludes the reads carrying the other insertion.
+        assert [(r.pos, r.ref, r.alt[0]) for r in document.records] == [
+            (15, "C", "A"),
+            (15, "C", "CG"),
+            (15, "C", "CTT"),
+        ]
+        assert document.records[0].info == "DP=7;AC=2;AF=0.285714"
+        assert document.records[1].info == "DP=5;AC=2;AF=0.400000"
+        assert document.records[2].info == "DP=5;AC=2;AF=0.400000"
+
+    def test_max_indel_length_endpoint_accepted(self) -> None:
+        document = call_variants(
+            [rec("c1", INDEL_REF)], [], call_indels=True, max_indel_length=1
+        )
+        assert document.records == ()
+
+    def test_indel_output_round_trips_and_normalizes(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [
+            ins_read("a"),
+            ins_read("b"),
+            del_read("c"),
+            del_read("d"),
+            fq("w", INDEL_REF),
+        ]
+        text = render_vcf(call_variants(refs, reads, call_indels=True))
+        document = read_vcf(StringIO(text))
+        assert len(document.records) == 2
+        normalized = normalize_vcf(document, refs)
+        assert render_vcf(normalized) == text
+
+    def test_indel_batching_is_byte_stable(self) -> None:
+        refs = [rec("c1", INDEL_REF)]
+        reads = [ins_read("a"), ins_read("b"), del_read("c"), fq("w", INDEL_REF)]
+        first = render_vcf(
+            call_variants(list(refs), list(reads), call_indels=True)
+        )
+        second = render_vcf(
+            call_variants(iter(list(refs)), iter(list(reads)), call_indels=True)
         )
         assert first == second

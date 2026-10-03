@@ -1,4 +1,4 @@
-"""Single-sample SNV calling from reads mapped against a reference.
+"""Single-sample SNV and optional short-indel calling from mapped reads.
 
 Public API:
 
@@ -8,12 +8,14 @@ Public API:
 - :func:`call_variants` — map FASTQ reads with the same local-alignment
   scoring, strand search and candidate adjudication as
   :func:`~genome_variant.mapping.map_reads`, pile up the quality-filtered
-  substitution evidence and return a VCFv4.2 document.
+  substitution evidence and return a VCFv4.2 document.  Short insertions
+  and deletions are called additionally when *call_indels* is enabled.
 
-Only substitutions between the bases ``A``, ``C``, ``G`` and ``T`` are
-called.  Insertions, deletions, unaligned portions, unmapped reads and
-ambiguous bases never contribute evidence.  Quality values never
-participate in mapping; they only filter base evidence.
+By default only substitutions between the bases ``A``, ``C``, ``G`` and
+``T`` are called.  Insertions, deletions, unaligned portions, unmapped
+reads and ambiguous bases never contribute substitution evidence.
+Quality values never participate in mapping; they only filter base
+evidence.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from collections.abc import Iterable
 from .mapping import _best_candidate
 from .quality import ReadQualityError
 from .sequence_io import SequenceRecord
-from .vcf import VcfFile, VcfHeader, VcfRecord
+from .vcf import VcfFile, VcfHeader, VcfRecord, normalize_record
 
 __all__ = [
     "VariantCallingError",
@@ -35,6 +37,13 @@ _ACGT = ("A", "C", "G", "T")
 _ACGT_SET = frozenset(_ACGT)
 _PHRED_MIN = 0
 _PHRED_MAX = 93
+
+# One read's normalized indel observations: (pos, ref, alt) mapped to the
+# reference gaps the event touches and whether its evidence passes the
+# quality floor.
+_IndelEventMap = dict[tuple[int, str, str], tuple[frozenset[int], bool]]
+# Per mapped read: reference index, aligned-base qualities, indel events.
+_IndelObservation = tuple[int, dict[int, int], _IndelEventMap]
 
 _META_LINES = (
     "##fileformat=VCFv4.2",
@@ -100,6 +109,8 @@ def call_variants(
     min_alt_fraction: float = 0.2,
     homozygous_fraction: float = 0.8,
     sample_name: str = "SAMPLE",
+    call_indels: bool = False,
+    max_indel_length: int = 50,
 ) -> VcfFile:
     """Call single-sample SNVs and return them as a :class:`~genome_variant.vcf.VcfFile`.
 
@@ -112,7 +123,7 @@ def call_variants(
     are among ``A``, ``C``, ``G`` and ``T``; on the reverse strand the
     quality and base are taken from the corresponding original-read
     position.  Insertions, deletions and unaligned alignment columns are
-    ignored.
+    ignored for SNV evidence.
 
     ``DP`` at a position is the total number of admitted ``ACGT``
     observations.  The single ALT is the non-reference base with the
@@ -122,11 +133,32 @@ def call_variants(
     ``1/1`` when that share is at least *homozygous_fraction*, otherwise
     ``0/1``.  Records follow reference input order and ascending POS.
 
+    When *call_indels* is true, short insertions and deletions are called
+    in addition from the contiguous ``I`` and ``D`` CIGAR segments of each
+    winning alignment.  An insertion is reported as the left reference
+    base plus the inserted sequence, a deletion as the left anchor base
+    plus the deleted reference fragment.  Events without a usable left
+    anchor, without aligned read bases on both sides, with any relevant
+    reference or inserted base outside ``ACGT``, or longer than
+    *max_indel_length* are ignored.  Insertion evidence requires the
+    flanking and all inserted read bases to meet *min_base_quality*;
+    deletion evidence requires the flanking read bases to meet it.  Raw
+    events are minimized and left-aligned with the reference-aware rules
+    of :func:`~genome_variant.vcf.normalize_record` and equivalent events
+    are merged by ``CHROM``, ``POS``, ``REF`` and ``ALT``.  An event's
+    ``DP`` is the number of mapped reads spanning both its flanks with
+    qualifying flank qualities and no other insertion or deletion at its
+    boundaries; ``AC`` is the number of those reads supporting the event.
+    The same *min_alt_count*, *min_alt_fraction* and *homozygous_fraction*
+    thresholds apply, ``AD`` is ``DP-AC,AC`` and SNV and indel records
+    are ordered by reference input order, ``POS``, ``REF`` and ``ALT``.
+
     *min_base_quality* is a non-boolean integer in 0-93 (default 20);
     *min_alt_count* a non-boolean positive integer (default 2);
     *min_alt_fraction* and *homozygous_fraction* finite numbers in 0-1
     (defaults 0.2 and 0.8), with the homozygous fraction no smaller than
-    the minimum ALT fraction.  Invalid thresholds raise :class:`ValueError`
+    the minimum ALT fraction; *max_indel_length* a non-boolean positive
+    integer (default 50).  Invalid thresholds raise :class:`ValueError`
     before either input is consumed.  Reads must carry quality values; a
     read without them or with a quality/sequence length mismatch raises
     :class:`~genome_variant.quality.ReadQualityError` when that read is
@@ -144,6 +176,7 @@ def call_variants(
         raise ValueError(
             "homozygous_fraction must not be smaller than min_alt_fraction"
         )
+    indel_length = _positive_threshold("max_indel_length", max_indel_length)
 
     sample = _validate_sample_name(sample_name)
 
@@ -167,6 +200,14 @@ def call_variants(
     counts_per_reference: list[dict[int, list[int]]] = [
         {} for _ in reference_records
     ]
+
+    # Per mapped read indel observations, only collected when enabled:
+    # (reference index, aligned qualities, normalized events).
+    sequences = {
+        reference.identifier: reference.sequence
+        for reference in reference_records
+    }
+    indel_observations: list[_IndelObservation] = []
 
     for read in reads:
         quality = read.quality
@@ -207,8 +248,20 @@ def call_variants(
             base_quality,
             counts_per_reference[ref_index],
         )
+        if call_indels:
+            aligned_at, events = _observe_indels(
+                read,
+                quality,
+                reference_records[ref_index],
+                alignment,
+                strand,
+                base_quality,
+                indel_length,
+                sequences,
+            )
+            indel_observations.append((ref_index, aligned_at, events))
 
-    records = []
+    records: list[tuple[int, VcfRecord]] = []
     for ref_index, reference in enumerate(reference_records):
         chromosome = reference.identifier
         reference_sequence = reference.sequence
@@ -224,10 +277,27 @@ def call_variants(
                 homo_fraction,
             )
             if record is not None:
-                records.append(record)
+                records.append((ref_index, record))
+
+    if call_indels:
+        records.extend(
+            _call_indels(
+                reference_records,
+                indel_observations,
+                base_quality,
+                alt_count,
+                alt_fraction,
+                homo_fraction,
+            )
+        )
+    # SNV records alone are already produced in this order; the sort only
+    # interleaves indel records and is stable for equal keys.
+    records.sort(
+        key=lambda item: (item[0], item[1].pos, item[1].ref, item[1].alt_text)
+    )
 
     header = VcfHeader(_META_LINES, (sample,))
-    return VcfFile(header, tuple(records))
+    return VcfFile(header, tuple(record for _, record in records))
 
 
 def _collect_evidence(
@@ -330,3 +400,238 @@ def _call_position(
         format_text="GT:DP:AD",
         sample_text=(sample,),
     )
+
+
+def _event_gaps(pos: int, ref: str, alt: str) -> frozenset[int]:
+    """The reference gap positions a normalized event touches.
+
+    A gap numbered ``g`` is the boundary between the zero-based reference
+    positions ``g - 1`` and ``g``.  An insertion touches only its
+    insertion point; a deletion touches both edges of the deleted
+    fragment.
+    """
+    if len(alt) > len(ref):
+        return frozenset((pos,))
+    return frozenset((pos, pos + len(ref) - 1))
+
+
+def _observe_indels(
+    read: SequenceRecord,
+    quality: tuple[int, ...],
+    reference: SequenceRecord,
+    alignment,
+    strand: str,
+    min_base_quality: int,
+    max_indel_length: int,
+    sequences: dict[str, str],
+) -> tuple[dict[int, int], _IndelEventMap]:
+    """Extract one mapped read's indel observations from its alignment.
+
+    Returns ``(aligned_at, events)``.  ``aligned_at`` maps a zero-based
+    reference position to the Phred quality of the read base aligned
+    there.  ``events`` maps each normalized event key ``(pos, ref, alt)``
+    (1-based POS) to ``(gaps, quality_ok)``: the reference gap positions
+    the event touches and whether this read's supporting evidence meets
+    the quality floor.  A read contributes at most one entry per
+    normalized event.
+    """
+    read_length = len(read.sequence)
+    aligned_reference = alignment.aligned_reference
+    aligned_query = alignment.aligned_query
+    columns = len(aligned_reference)
+
+    # Per column: the zero-based reference position (None on a reference
+    # gap), the query index on the aligned strand (None on a query gap)
+    # and the next unconsumed zero-based reference position.
+    ref_positions: list[int | None] = []
+    query_indices: list[int | None] = []
+    next_reference: list[int] = []
+    reference_position = alignment.reference_start
+    query_index = alignment.query_start
+    for column in range(columns):
+        next_reference.append(reference_position)
+        reference_char = aligned_reference[column]
+        query_char = aligned_query[column]
+        ref_positions.append(
+            reference_position if reference_char != "-" else None
+        )
+        query_indices.append(query_index if query_char != "-" else None)
+        if reference_char != "-":
+            reference_position += 1
+        if query_char != "-":
+            query_index += 1
+
+    def column_quality(column: int) -> int:
+        index = query_indices[column]
+        assert index is not None
+        if strand == "+":
+            return quality[index]
+        # Map the quality back to the original read coordinates; the
+        # quality string is never reverse complemented.
+        return quality[read_length - 1 - index]
+
+    aligned_at: dict[int, int] = {}
+    for column in range(columns):
+        ref_position = ref_positions[column]
+        if ref_position is not None and query_indices[column] is not None:
+            aligned_at[ref_position] = column_quality(column)
+
+    events: _IndelEventMap = {}
+    reference_sequence = reference.sequence
+    column = 0
+    while column < columns:
+        insertion = aligned_reference[column] == "-"
+        deletion = not insertion and aligned_query[column] == "-"
+        if not insertion and not deletion:
+            column += 1
+            continue
+        # One contiguous I or D CIGAR segment: a maximal run of columns
+        # gapped on the same side.
+        start = column
+        while column < columns:
+            reference_gap = aligned_reference[column] == "-"
+            query_gap = aligned_query[column] == "-"
+            if reference_gap != insertion or query_gap != deletion:
+                break
+            column += 1
+        end = column
+
+        length = end - start
+        if length > max_indel_length:
+            continue
+        # The event needs an aligned read base on both sides.
+        if start == 0 or end == columns:
+            continue
+        if query_indices[start - 1] is None or query_indices[end] is None:
+            continue
+        # The gap sits immediately left of the next reference position;
+        # the base before it is the left anchor.
+        gap = next_reference[start]
+        anchor = gap - 1
+        if anchor < 0:
+            continue
+        anchor_base = reference_sequence[anchor]
+        if anchor_base not in _ACGT_SET:
+            continue
+        if insertion:
+            inserted = aligned_query[start:end]
+            if any(base not in _ACGT_SET for base in inserted):
+                continue
+            ref_allele = anchor_base
+            alt_allele = anchor_base + inserted
+        else:
+            deleted = reference_sequence[gap : gap + length]
+            if any(base not in _ACGT_SET for base in deleted):
+                continue
+            ref_allele = reference_sequence[anchor : gap + length]
+            alt_allele = anchor_base
+
+        quality_ok = (
+            column_quality(start - 1) >= min_base_quality
+            and column_quality(end) >= min_base_quality
+        )
+        if quality_ok and insertion:
+            quality_ok = all(
+                column_quality(inserted_column) >= min_base_quality
+                for inserted_column in range(start, end)
+            )
+
+        # Minimize and left-align with the existing reference-aware
+        # rules, then merge equivalent events.
+        raw = VcfRecord(
+            chrom=reference.identifier,
+            pos=anchor + 1,
+            id=".",
+            ref=ref_allele,
+            alt=(alt_allele,),
+            qual=".",
+            filter="PASS",
+            info="",
+        )
+        normalized = normalize_record(raw, sequences)
+        key = (normalized.pos, normalized.ref, normalized.alt[0])
+        gaps = _event_gaps(normalized.pos, normalized.ref, normalized.alt[0])
+        existing = events.get(key)
+        if existing is None:
+            events[key] = (gaps, quality_ok)
+        else:
+            events[key] = (existing[0], existing[1] or quality_ok)
+
+    return aligned_at, events
+
+
+def _call_indels(
+    reference_records: list[SequenceRecord],
+    observations: list[_IndelObservation],
+    min_base_quality: int,
+    min_alt_count: int,
+    min_alt_fraction: float,
+    homo_fraction: float,
+) -> list[tuple[int, VcfRecord]]:
+    """Build the VCF records for the observed indel candidates."""
+    records: list[tuple[int, VcfRecord]] = []
+    for ref_index, reference in enumerate(reference_records):
+        reads_here = [
+            (aligned_at, events)
+            for observed_index, aligned_at, events in observations
+            if observed_index == ref_index
+        ]
+        if not reads_here:
+            continue
+        candidates: dict[tuple[int, str, str], frozenset[int]] = {}
+        for _, events in reads_here:
+            for key, (gaps, _) in events.items():
+                candidates.setdefault(key, gaps)
+        for (pos, ref, alt), gaps in candidates.items():
+            # Zero-based reference positions flanking the event.
+            left = pos - 1
+            right = pos - 1 + len(ref)
+            depth = 0
+            alt_support = 0
+            for aligned_at, events in reads_here:
+                left_quality = aligned_at.get(left)
+                right_quality = aligned_at.get(right)
+                if left_quality is None or right_quality is None:
+                    continue
+                if (
+                    left_quality < min_base_quality
+                    or right_quality < min_base_quality
+                ):
+                    continue
+                key = (pos, ref, alt)
+                if any(
+                    other_key != key
+                    and not other_gaps.isdisjoint(gaps)
+                    for other_key, (other_gaps, _) in events.items()
+                ):
+                    continue
+                depth += 1
+                evidence = events.get(key)
+                if evidence is not None and evidence[1]:
+                    alt_support += 1
+            if alt_support < min_alt_count:
+                continue
+            fraction = alt_support / depth
+            if fraction < min_alt_fraction:
+                continue
+            genotype = "1/1" if fraction >= homo_fraction else "0/1"
+            info = f"DP={depth};AC={alt_support};AF={fraction:.6f}"
+            sample = f"{genotype}:{depth}:{depth - alt_support},{alt_support}"
+            records.append(
+                (
+                    ref_index,
+                    VcfRecord(
+                        chrom=reference.identifier,
+                        pos=pos,
+                        id=".",
+                        ref=ref,
+                        alt=(alt,),
+                        qual=".",
+                        filter="PASS",
+                        info=info,
+                        format_text="GT:DP:AD",
+                        sample_text=(sample,),
+                    ),
+                )
+            )
+    return records
