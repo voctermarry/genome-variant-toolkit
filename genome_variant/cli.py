@@ -1579,19 +1579,16 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
             print(f"{parser.prog}: reference: {exc}", file=sys.stderr)
             return 1
 
-        try:
-            read_records = list(read_sequences(read_stream, format=args.reads_format))
-        except _READ_ERRORS as exc:
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 2
-        except OSError as exc:
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-
+        # The reads stream is consumed lazily in a single pass by
+        # call_variants, so resident memory stays bounded no matter how
+        # many reads the input holds.  A malformed record surfaces only
+        # when the iteration reaches it; nothing has been written to the
+        # output by then.
+        reads = read_sequences(read_stream, format=args.reads_format)
         try:
             document = call_variants(
                 reference_records,
-                read_records,
+                reads,
                 min_base_quality=args.min_base_quality,
                 min_alt_count=args.min_alt_count,
                 min_alt_fraction=args.min_alt_fraction,
@@ -1603,14 +1600,12 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
                 ),
             )
             text = render_vcf(document)
-        except (
-            VariantCallingError,
-            ReadQualityError,
-            SequenceValidationError,
-            ValueError,
-        ) as exc:
+        except _READ_ERRORS as exc:
             print(f"{parser.prog}: {exc}", file=sys.stderr)
             return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
 
         if args.output == "-":
             # Keep output byte-stable across platforms: no newline

@@ -43,8 +43,30 @@ _PHRED_MAX = 93
 # reference gaps the event touches and whether its evidence passes the
 # quality floor.
 _IndelEventMap = dict[tuple[int, str, str], tuple[frozenset[int], bool]]
-# Per mapped read: reference index, aligned-base qualities, indel events.
-_IndelObservation = tuple[int, dict[int, int], _IndelEventMap]
+
+# Streaming indel aggregation, updated as each read is consumed and never
+# growing with the number of reads:
+#
+# - ``pair_counts[(ref_index, left, right)]`` holds ``[flanks_ok,
+#   left_gap, right_gap, both_gaps]``: how many mapped reads cover both
+#   zero-based flank positions with aligned, quality-passing bases, and
+#   how many of those reads carry their own indel events touching the
+#   candidate gap positions ``left + 1`` and ``right``.  A normalized
+#   candidate's flanks are at most ``max_indel_length + 1`` apart, so the
+#   table is bounded by the reference length and that parameter.
+# - ``candidates[(ref_index, pos, ref, alt)]`` holds ``[gaps,
+#   alt_support, carriers_ok, conflict]``: the event's reference gaps and
+#   the per-candidate counts only reads carrying the event itself can
+#   contribute to.
+#
+# A candidate's depth decomposes over these aggregates as
+# ``flanks_ok - (left_gap + right_gap - both_gaps) + carriers_ok -
+# conflict``: every flank-covering read counts, reads whose own events
+# touch the candidate's gaps are excluded, reads carrying the candidate
+# itself always touch its gaps and are added back, and carriers with a
+# conflicting neighbouring event are removed again.
+_PairCounts = dict[tuple[int, int, int], list[int]]
+_CandidateCounts = dict[tuple[int, int, str, str], list]
 
 _META_LINES = (
     "##fileformat=VCFv4.2",
@@ -166,6 +188,13 @@ def call_variants(
     reached.  An empty reference collection, duplicate reference
     identifiers or an empty/whitespace-only/tab-containing *sample_name*
     raise :class:`VariantCallingError`.
+
+    The *reads* iterable is consumed in a single forward pass.  Per-read
+    alignment positions, qualities and indel event sets are discarded as
+    soon as the read is folded into the aggregate counters, so resident
+    memory is bounded by the reference records, the per-position SNV
+    counts, the distinct normalized indel candidates and their depth
+    aggregates — never by the number of reads consumed.
     """
     base_quality = _quality_threshold("min_base_quality", min_base_quality)
     alt_count = _positive_threshold("min_alt_count", min_alt_count)
@@ -202,13 +231,15 @@ def call_variants(
         {} for _ in reference_records
     ]
 
-    # Per mapped read indel observations, only collected when enabled:
-    # (reference index, aligned qualities, normalized events).
+    # Streaming indel aggregates, only maintained when enabled; per-read
+    # alignment positions, qualities and event sets are discarded as soon
+    # as the read that produced them has been folded in.
     sequences = {
         reference.identifier: reference.sequence
         for reference in reference_records
     }
-    indel_observations: list[_IndelObservation] = []
+    pair_counts: _PairCounts = {}
+    indel_candidates: _CandidateCounts = {}
 
     for read in reads:
         quality = read.quality
@@ -261,7 +292,15 @@ def call_variants(
                 indel_length,
                 sequences,
             )
-            indel_observations.append((ref_index, aligned_at, events))
+            _accumulate_indels(
+                ref_index,
+                aligned_at,
+                events,
+                base_quality,
+                indel_length,
+                pair_counts,
+                indel_candidates,
+            )
 
     records: list[tuple[int, VcfRecord]] = []
     for ref_index, reference in enumerate(reference_records):
@@ -285,8 +324,8 @@ def call_variants(
         records.extend(
             _call_indels(
                 reference_records,
-                indel_observations,
-                base_quality,
+                pair_counts,
+                indel_candidates,
                 alt_count,
                 alt_fraction,
                 homo_fraction,
@@ -531,78 +570,132 @@ def _observe_indels(
     return aligned_at, events
 
 
+def _accumulate_indels(
+    ref_index: int,
+    aligned_at: dict[int, int],
+    events: _IndelEventMap,
+    min_base_quality: int,
+    max_indel_length: int,
+    pair_counts: _PairCounts,
+    candidates: _CandidateCounts,
+) -> None:
+    """Fold one mapped read's indel observations into the aggregates.
+
+    Everything derived from the read stays local to this call; only the
+    bounded flank-pair and per-candidate counters are updated.  A
+    normalized candidate's flanks are the zero-based positions
+    ``pos - 1`` and ``pos - 1 + len(ref)``: one apart for an insertion
+    and at most ``max_indel_length + 1`` apart for a deletion, so only
+    flank pairs within that distance can ever be queried.
+    """
+    # Reference gap positions touched by this read's own events.
+    touched: set[int] = set()
+    for gaps, _ in events.values():
+        touched.update(gaps)
+
+    qualified = {
+        position
+        for position, quality in aligned_at.items()
+        if quality >= min_base_quality
+    }
+    max_distance = max_indel_length + 1
+    for left in qualified:
+        for right in range(left + 1, left + max_distance + 1):
+            if right not in qualified:
+                continue
+            entry = pair_counts.setdefault(
+                (ref_index, left, right), [0, 0, 0, 0]
+            )
+            entry[0] += 1
+            left_gap = left + 1 in touched
+            right_gap = right in touched
+            if left_gap:
+                entry[1] += 1
+            if right_gap:
+                entry[2] += 1
+            if left_gap and right_gap:
+                entry[3] += 1
+
+    for (pos, ref, alt), (gaps, quality_ok) in events.items():
+        key = (ref_index, pos, ref, alt)
+        entry = candidates.get(key)
+        if entry is None:
+            entry = [gaps, 0, 0, 0]
+            candidates[key] = entry
+        left_quality = aligned_at.get(pos - 1)
+        right_quality = aligned_at.get(pos - 1 + len(ref))
+        if (
+            left_quality is None
+            or right_quality is None
+            or left_quality < min_base_quality
+            or right_quality < min_base_quality
+        ):
+            continue
+        # This read carries the event and spans its flanks with
+        # qualifying qualities.
+        entry[2] += 1
+        conflict = any(
+            other_key != (pos, ref, alt)
+            and not other_gaps.isdisjoint(gaps)
+            for other_key, (other_gaps, _) in events.items()
+        )
+        if conflict:
+            entry[3] += 1
+        elif quality_ok:
+            entry[1] += 1
+
+
 def _call_indels(
     reference_records: list[SequenceRecord],
-    observations: list[_IndelObservation],
-    min_base_quality: int,
+    pair_counts: _PairCounts,
+    candidates: _CandidateCounts,
     min_alt_count: int,
     min_alt_fraction: float,
     homo_fraction: float,
 ) -> list[tuple[int, VcfRecord]]:
-    """Build the VCF records for the observed indel candidates."""
+    """Build the VCF records for the aggregated indel candidates."""
     records: list[tuple[int, VcfRecord]] = []
-    for ref_index, reference in enumerate(reference_records):
-        reads_here = [
-            (aligned_at, events)
-            for observed_index, aligned_at, events in observations
-            if observed_index == ref_index
-        ]
-        if not reads_here:
+    for (ref_index, pos, ref, alt), (
+        _,
+        alt_support,
+        carriers_ok,
+        conflict,
+    ) in candidates.items():
+        # Zero-based reference positions flanking the event.
+        left = pos - 1
+        right = pos - 1 + len(ref)
+        flanks_ok, left_gap, right_gap, both_gaps = pair_counts.get(
+            (ref_index, left, right), (0, 0, 0, 0)
+        )
+        # Reads whose own events touch the candidate's gaps do not count
+        # towards its depth; reads carrying the candidate itself always
+        # touch its gaps, so they are added back unless a conflicting
+        # neighbouring event excludes them again.
+        spoiled = left_gap + right_gap - both_gaps
+        depth = flanks_ok - spoiled + carriers_ok - conflict
+        if alt_support < min_alt_count:
             continue
-        candidates: dict[tuple[int, str, str], frozenset[int]] = {}
-        for _, events in reads_here:
-            for key, (gaps, _) in events.items():
-                candidates.setdefault(key, gaps)
-        for (pos, ref, alt), gaps in candidates.items():
-            # Zero-based reference positions flanking the event.
-            left = pos - 1
-            right = pos - 1 + len(ref)
-            depth = 0
-            alt_support = 0
-            for aligned_at, events in reads_here:
-                left_quality = aligned_at.get(left)
-                right_quality = aligned_at.get(right)
-                if left_quality is None or right_quality is None:
-                    continue
-                if (
-                    left_quality < min_base_quality
-                    or right_quality < min_base_quality
-                ):
-                    continue
-                key = (pos, ref, alt)
-                if any(
-                    other_key != key
-                    and not other_gaps.isdisjoint(gaps)
-                    for other_key, (other_gaps, _) in events.items()
-                ):
-                    continue
-                depth += 1
-                evidence = events.get(key)
-                if evidence is not None and evidence[1]:
-                    alt_support += 1
-            if alt_support < min_alt_count:
-                continue
-            fraction = alt_support / depth
-            if fraction < min_alt_fraction:
-                continue
-            genotype = "1/1" if fraction >= homo_fraction else "0/1"
-            info = f"DP={depth};AC={alt_support};AF={fraction:.6f}"
-            sample = f"{genotype}:{depth}:{depth - alt_support},{alt_support}"
-            records.append(
-                (
-                    ref_index,
-                    VcfRecord(
-                        chrom=reference.identifier,
-                        pos=pos,
-                        id=".",
-                        ref=ref,
-                        alt=(alt,),
-                        qual=".",
-                        filter="PASS",
-                        info=info,
-                        format_text="GT:DP:AD",
-                        sample_text=(sample,),
-                    ),
-                )
+        fraction = alt_support / depth
+        if fraction < min_alt_fraction:
+            continue
+        genotype = "1/1" if fraction >= homo_fraction else "0/1"
+        info = f"DP={depth};AC={alt_support};AF={fraction:.6f}"
+        sample = f"{genotype}:{depth}:{depth - alt_support},{alt_support}"
+        records.append(
+            (
+                ref_index,
+                VcfRecord(
+                    chrom=reference_records[ref_index].identifier,
+                    pos=pos,
+                    id=".",
+                    ref=ref,
+                    alt=(alt,),
+                    qual=".",
+                    filter="PASS",
+                    info=info,
+                    format_text="GT:DP:AD",
+                    sample_text=(sample,),
+                ),
             )
+        )
     return records
