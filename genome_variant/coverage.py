@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
+from ._columns import alignment_columns
 from .alignment import _score_parameter
 from .mapping import MappingReferenceError, _best_candidate
 from .sequence_io import SequenceRecord
@@ -164,7 +165,7 @@ def coverage_report(
             ref_index, alignment, _strand = winner
             mapped_reads[ref_index] += 1
             concordant[ref_index] += _collect(
-                alignment, depths[ref_index]
+                alignment_columns(alignment), depths[ref_index]
             )
 
         for ref_index, reference in enumerate(reference_records):
@@ -190,30 +191,21 @@ def coverage_report(
     return _iter()
 
 
-def _collect(alignment, depth: list[int]) -> int:
+def _collect(columns, depth: list[int]) -> int:
     """Add one read's winning alignment to *depth*; return concordance.
 
-    The aligned query is oriented against the reference, so on a
-    reverse-strand win its characters are already expressed on the
-    reference's forward strand.
+    Columns share the canonical interpretation used by every other
+    post-mapping entry: ``=``/``X`` add one observation at their
+    reference position, ``D`` consumes the reference without depth and
+    ``I`` has no reference position.  The observed base is already
+    expressed on the reference's forward strand on a reverse-strand win.
     """
-    aligned_reference = alignment.aligned_reference
-    aligned_query = alignment.aligned_query
-    reference_position = alignment.reference_start
     concordant = 0
-
-    for column in range(len(aligned_reference)):
-        reference_char = aligned_reference[column]
-        if reference_char == "-":
-            # Insertion: consumes the query only, no reference position.
-            continue
-        observed = aligned_query[column]
-        if observed != "-":
-            # ``=`` or ``X``: one more observation at this position.
-            depth[reference_position] += 1
-            if observed == reference_char:
+    for column in columns:
+        if column.op in ("=", "X"):
+            position = column.reference_position
+            assert position is not None
+            depth[position] += 1
+            if column.query_base == column.reference_base:
                 concordant += 1
-        # Deletions consume the reference without adding depth.
-        reference_position += 1
-
     return concordant
