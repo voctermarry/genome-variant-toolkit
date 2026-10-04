@@ -43,8 +43,8 @@ _PHRED_MAX = 93
 # reference gaps the event touches and whether its evidence passes the
 # quality floor.
 _IndelEventMap = dict[tuple[int, str, str], tuple[frozenset[int], bool]]
-# Per mapped read: reference index, aligned-base qualities, indel events.
-_IndelObservation = tuple[int, dict[int, int], _IndelEventMap]
+# One normalized indel candidate: (reference index, pos, ref, alt).
+_IndelKey = tuple[int, int, str, str]
 
 _META_LINES = (
     "##fileformat=VCFv4.2",
@@ -166,6 +166,12 @@ def call_variants(
     reached.  An empty reference collection, duplicate reference
     identifiers or an empty/whitespace-only/tab-containing *sample_name*
     raise :class:`VariantCallingError`.
+
+    *reads* may be any iterable, including one that can be traversed only
+    once: each read is consumed and mapped exactly once, and resident
+    memory stays bounded by the reference records, the per-position SNV
+    counts and the distinct normalized indel candidates — never by the
+    number of consumed reads.
     """
     base_quality = _quality_threshold("min_base_quality", min_base_quality)
     alt_count = _positive_threshold("min_alt_count", min_alt_count)
@@ -202,13 +208,23 @@ def call_variants(
         {} for _ in reference_records
     ]
 
-    # Per mapped read indel observations, only collected when enabled:
-    # (reference index, aligned qualities, normalized events).
+    # Indel evidence is aggregated read by read (only when enabled), so
+    # resident memory stays bounded by the reference, the per-position
+    # SNV counts and the distinct normalized candidates — never by the
+    # number of consumed reads.
     sequences = {
         reference.identifier: reference.sequence
         for reference in reference_records
     }
-    indel_observations: list[_IndelObservation] = []
+    indels = (
+        _IndelTracker(
+            [len(reference.sequence) for reference in reference_records],
+            base_quality,
+            indel_length,
+        )
+        if call_indels
+        else None
+    )
 
     for read in reads:
         quality = read.quality
@@ -261,7 +277,8 @@ def call_variants(
                 indel_length,
                 sequences,
             )
-            indel_observations.append((ref_index, aligned_at, events))
+            assert indels is not None
+            indels.observe(ref_index, aligned_at, events)
 
     records: list[tuple[int, VcfRecord]] = []
     for ref_index, reference in enumerate(reference_records):
@@ -282,11 +299,11 @@ def call_variants(
                 records.append((ref_index, record))
 
     if call_indels:
+        assert indels is not None
         records.extend(
             _call_indels(
                 reference_records,
-                indel_observations,
-                base_quality,
+                indels.candidates,
                 alt_count,
                 alt_fraction,
                 homo_fraction,
@@ -531,78 +548,221 @@ def _observe_indels(
     return aligned_at, events
 
 
+class _IndelTracker:
+    """Streaming aggregation of one sample's indel evidence.
+
+    Reads are observed one at a time; nothing per read is retained after
+    :meth:`observe` returns.  Resident state is only:
+
+    - ``candidates``: the distinct normalized events observed so far,
+      mapped to their aggregate ``[gaps, depth, alt_support]``;
+    - the per-reference aggregates used to backfill the depth of a
+      candidate that is first observed in a later read.
+
+    An event's ``DP`` counts the mapped reads on its reference that span
+    both flanks (zero-based ``left = pos - 1`` and
+    ``right = pos - 1 + len(ref)``) with flank qualities of at least
+    *min_base_quality* and that carry no other event touching the
+    candidate's gaps.  Because ``right - left = len(ref)`` never exceeds
+    ``max_indel_length + 1``, the number of reads admitting each flank
+    pair ``(left, left + distance)`` with ``distance`` up to that bound
+    is sufficient to reconstruct the spanning count of any candidate
+    registered later.  Reads carrying an event that touches a gap ``b``
+    of a future candidate are excluded through three boundary
+    statistics: counts of reads with an event touching ``b`` that admit
+    the pair ``(b - 1, b - 1 + distance)`` (``b`` as the candidate's
+    left gap) or ``(b - distance, b)`` (``b`` as the right gap), and, for
+    the two-gap deletion case, counts of reads touching both gaps that
+    admit the pair ``(b1 - 1, b2)`` — combined by inclusion-exclusion
+    over the at most two gaps of a candidate.  All of these are bounded
+    by the reference lengths and *max_indel_length*, never by the number
+    of consumed reads.
+    """
+
+    def __init__(
+        self,
+        reference_lengths: list[int],
+        min_base_quality: int,
+        max_indel_length: int,
+    ) -> None:
+        self._min_base_quality = min_base_quality
+        # (ref_index, pos, ref, alt) -> [gaps, depth, alt_support].
+        self.candidates: dict[_IndelKey, list[object]] = {}
+        # (ref_index, left flank) -> candidate keys registered there.
+        self._by_left: dict[tuple[int, int], list[_IndelKey]] = {}
+        # Per reference, left flank -> distance -> reads admitting both.
+        self._flank_pairs: list[dict[int, dict[int, int]]] = [
+            {} for _ in reference_lengths
+        ]
+        # Per reference, touched gap -> distance -> reads admitting the
+        # pair (gap - 1, gap - 1 + distance) / (gap - distance, gap).
+        self._gap_left: list[dict[int, dict[int, int]]] = [
+            {} for _ in reference_lengths
+        ]
+        self._gap_right: list[dict[int, dict[int, int]]] = [
+            {} for _ in reference_lengths
+        ]
+        # Per reference, (first gap, second gap) -> reads touching both
+        # and admitting the pair (first - 1, second).
+        self._gap_pairs: list[dict[tuple[int, int], int]] = [
+            {} for _ in reference_lengths
+        ]
+        # Per reference, the largest flank distance a candidate can have:
+        # len(ref) <= max_indel_length + 1 and both flanks must fit.
+        self._max_distance = [
+            min(max_indel_length + 1, max(length - 1, 0))
+            for length in reference_lengths
+        ]
+
+    def observe(
+        self,
+        ref_index: int,
+        aligned_at: dict[int, int],
+        events: _IndelEventMap,
+    ) -> None:
+        """Fold one mapped read's indel observation into the aggregates.
+
+        ``aligned_at`` maps zero-based reference positions to the quality
+        of the read base aligned there; ``events`` is the read's
+        normalized event map as produced by :func:`_observe_indels`.
+        """
+        admitted = {
+            position
+            for position, quality in aligned_at.items()
+            if quality >= self._min_base_quality
+        }
+        max_distance = self._max_distance[ref_index]
+
+        # Register newly observed events.  A candidate first observed by
+        # this read cannot be carried by any earlier read, so its depth
+        # from earlier reads is the spanning count minus the reads whose
+        # own events touch the candidate's gaps.
+        for (pos, ref, alt), (gaps, _quality_ok) in events.items():
+            key = (ref_index, pos, ref, alt)
+            if key in self.candidates:
+                continue
+            left = pos - 1
+            distance = len(ref)
+            depth = self._flank_pairs[ref_index].get(left, {}).get(distance, 0)
+            touched = sorted(gaps)
+            blocked = 0
+            for boundary in touched:
+                if boundary == left + 1:
+                    blocked += (
+                        self._gap_left[ref_index]
+                        .get(boundary, {})
+                        .get(distance, 0)
+                    )
+                else:  # boundary == left + distance (the right flank gap)
+                    blocked += (
+                        self._gap_right[ref_index]
+                        .get(boundary, {})
+                        .get(distance, 0)
+                    )
+            if len(touched) == 2:
+                blocked -= self._gap_pairs[ref_index].get(
+                    (touched[0], touched[1]), 0
+                )
+            self.candidates[key] = [gaps, depth - blocked, 0]
+            self._by_left.setdefault((ref_index, left), []).append(key)
+
+        # This read's own contribution to every registered candidate it
+        # spans: admitted flanks and no other event of this read touching
+        # the candidate's gaps.
+        for left in admitted:
+            for key in self._by_left.get((ref_index, left), ()):
+                _, pos, ref, alt = key
+                if pos - 1 + len(ref) not in admitted:
+                    continue
+                gaps = self.candidates[key][0]
+                if any(
+                    other != (pos, ref, alt)
+                    and not other_gaps.isdisjoint(gaps)
+                    for other, (other_gaps, _) in events.items()
+                ):
+                    continue
+                self.candidates[key][1] += 1
+                evidence = events.get((pos, ref, alt))
+                if evidence is not None and evidence[1]:
+                    self.candidates[key][2] += 1
+
+        # Fold the read into the aggregates consulted by later
+        # registrations; only then is this read part of the backfill.
+        if not max_distance:
+            return
+        flank_pairs = self._flank_pairs[ref_index]
+        for left in admitted:
+            row = flank_pairs.setdefault(left, {})
+            for distance in range(1, max_distance + 1):
+                if left + distance in admitted:
+                    row[distance] = row.get(distance, 0) + 1
+        touched = sorted(
+            {gap for gaps, _ in events.values() for gap in gaps}
+        )
+        if not touched:
+            return
+        gap_left = self._gap_left[ref_index]
+        gap_right = self._gap_right[ref_index]
+        for boundary in touched:
+            if boundary - 1 in admitted:
+                row = gap_left.setdefault(boundary, {})
+                for distance in range(1, max_distance + 1):
+                    if boundary - 1 + distance in admitted:
+                        row[distance] = row.get(distance, 0) + 1
+            if boundary in admitted:
+                row = gap_right.setdefault(boundary, {})
+                for distance in range(1, max_distance + 1):
+                    if boundary - distance in admitted:
+                        row[distance] = row.get(distance, 0) + 1
+        gap_pairs = self._gap_pairs[ref_index]
+        for index, first in enumerate(touched):
+            if first - 1 not in admitted:
+                continue
+            for second in touched[index + 1 :]:
+                if second - first >= max_distance:
+                    break
+                if second in admitted:
+                    pair = (first, second)
+                    gap_pairs[pair] = gap_pairs.get(pair, 0) + 1
+
+
 def _call_indels(
     reference_records: list[SequenceRecord],
-    observations: list[_IndelObservation],
-    min_base_quality: int,
+    candidates: dict[_IndelKey, list[object]],
     min_alt_count: int,
     min_alt_fraction: float,
     homo_fraction: float,
 ) -> list[tuple[int, VcfRecord]]:
-    """Build the VCF records for the observed indel candidates."""
+    """Build the VCF records for the aggregated indel candidates."""
     records: list[tuple[int, VcfRecord]] = []
-    for ref_index, reference in enumerate(reference_records):
-        reads_here = [
-            (aligned_at, events)
-            for observed_index, aligned_at, events in observations
-            if observed_index == ref_index
-        ]
-        if not reads_here:
+    for (ref_index, pos, ref, alt), (
+        _gaps,
+        depth,
+        alt_support,
+    ) in candidates.items():
+        if alt_support < min_alt_count:
             continue
-        candidates: dict[tuple[int, str, str], frozenset[int]] = {}
-        for _, events in reads_here:
-            for key, (gaps, _) in events.items():
-                candidates.setdefault(key, gaps)
-        for (pos, ref, alt), gaps in candidates.items():
-            # Zero-based reference positions flanking the event.
-            left = pos - 1
-            right = pos - 1 + len(ref)
-            depth = 0
-            alt_support = 0
-            for aligned_at, events in reads_here:
-                left_quality = aligned_at.get(left)
-                right_quality = aligned_at.get(right)
-                if left_quality is None or right_quality is None:
-                    continue
-                if (
-                    left_quality < min_base_quality
-                    or right_quality < min_base_quality
-                ):
-                    continue
-                key = (pos, ref, alt)
-                if any(
-                    other_key != key
-                    and not other_gaps.isdisjoint(gaps)
-                    for other_key, (other_gaps, _) in events.items()
-                ):
-                    continue
-                depth += 1
-                evidence = events.get(key)
-                if evidence is not None and evidence[1]:
-                    alt_support += 1
-            if alt_support < min_alt_count:
-                continue
-            fraction = alt_support / depth
-            if fraction < min_alt_fraction:
-                continue
-            genotype = "1/1" if fraction >= homo_fraction else "0/1"
-            info = f"DP={depth};AC={alt_support};AF={fraction:.6f}"
-            sample = f"{genotype}:{depth}:{depth - alt_support},{alt_support}"
-            records.append(
-                (
-                    ref_index,
-                    VcfRecord(
-                        chrom=reference.identifier,
-                        pos=pos,
-                        id=".",
-                        ref=ref,
-                        alt=(alt,),
-                        qual=".",
-                        filter="PASS",
-                        info=info,
-                        format_text="GT:DP:AD",
-                        sample_text=(sample,),
-                    ),
-                )
+        fraction = alt_support / depth
+        if fraction < min_alt_fraction:
+            continue
+        genotype = "1/1" if fraction >= homo_fraction else "0/1"
+        info = f"DP={depth};AC={alt_support};AF={fraction:.6f}"
+        sample = f"{genotype}:{depth}:{depth - alt_support},{alt_support}"
+        records.append(
+            (
+                ref_index,
+                VcfRecord(
+                    chrom=reference_records[ref_index].identifier,
+                    pos=pos,
+                    id=".",
+                    ref=ref,
+                    alt=(alt,),
+                    qual=".",
+                    filter="PASS",
+                    info=info,
+                    format_text="GT:DP:AD",
+                    sample_text=(sample,),
+                ),
             )
+        )
     return records
