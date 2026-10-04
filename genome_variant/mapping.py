@@ -24,6 +24,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from .alignment import align_pair, _score_parameter
+from ._alignment_columns import WinningAlignment
 from .sequence_io import SequenceRecord
 
 __all__ = [
@@ -189,13 +190,14 @@ def _best_candidate(
     gap_open: int,
     gap_extend: int,
     min_score: int,
-):
+) -> WinningAlignment | None:
     """Return the winning mapping candidate for *read*, or ``None``.
 
-    The result is ``(reference_index, alignment, strand)`` where the
-    alignment on a reverse-strand win is oriented against the read's
-    reverse complement.  Candidates are scored and tie-broken exactly as
-    in :func:`map_reads`: highest score, then reference input index,
+    The result is a :class:`~genome_variant._alignment_columns.WinningAlignment`
+    carrying the winning reference index, strand and the alignment
+    oriented against the read's reverse complement on a reverse-strand
+    win.  Candidates are scored and tie-broken exactly as in
+    :func:`map_reads`: highest score, then reference input index,
     reference start/end, the forward strand, the original-read query
     interval and the lexicographically smallest CIGAR.
     """
@@ -213,6 +215,7 @@ def _best_candidate(
     ] | None = None
     best_alignment = None
     best_strand = ""
+    best_ref_index = -1
 
     for ref_index, reference in enumerate(references):
         for strand, query_record in (("+", read), ("-", reverse_record)):
@@ -231,20 +234,18 @@ def _best_candidate(
             if strand == "+":
                 query_start = alignment.query_start
                 query_end = alignment.query_end
-                strand_rank = 0
             else:
                 # Convert the interval on the reverse-complement read back
                 # to zero-based half-open coordinates on the original read.
                 query_start = read_length - alignment.query_end
                 query_end = read_length - alignment.query_start
-                strand_rank = 1
 
             key = (
                 -alignment.score,
                 ref_index,
                 alignment.reference_start,
                 alignment.reference_end,
-                strand_rank,
+                0 if strand == "+" else 1,
                 query_start,
                 query_end,
                 alignment.cigar,
@@ -253,10 +254,16 @@ def _best_candidate(
                 best_key = key
                 best_alignment = alignment
                 best_strand = strand
+                best_ref_index = ref_index
 
     if best_alignment is None or best_key is None:
         return None
-    return best_key[1], best_alignment, best_strand
+    return WinningAlignment(
+        reference_record=best_ref_index,
+        strand=best_strand,
+        read_length=read_length,
+        alignment=best_alignment,
+    )
 
 
 def _map_one(
@@ -281,26 +288,20 @@ def _map_one(
     if winner is None:
         return _unmapped(record_index, read)
 
-    ref_index, best_alignment, best_strand = winner
-    read_length = len(read.sequence)
-    if best_strand == "+":
-        query_start = best_alignment.query_start
-        query_end = best_alignment.query_end
-    else:
-        query_start = read_length - best_alignment.query_end
-        query_end = read_length - best_alignment.query_start
+    best_alignment = winner.alignment
+    query_start, query_end = winner.original_query_interval()
 
     return ReadMapping(
         record=record_index,
         id=read.identifier,
         mapped=True,
-        reference_record=ref_index,
-        reference=references[ref_index].identifier,
+        reference_record=winner.reference_record,
+        reference=references[winner.reference_record].identifier,
         reference_start=best_alignment.reference_start,
         reference_end=best_alignment.reference_end,
         query_start=query_start,
         query_end=query_end,
-        strand=best_strand,
+        strand=winner.strand,
         score=best_alignment.score,
         cigar=best_alignment.cigar,
     )

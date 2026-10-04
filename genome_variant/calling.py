@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 
+from ._alignment_columns import AlignmentColumn, WinningAlignment
 from .mapping import _best_candidate
 from .quality import ReadQualityError
 from .sequence_io import SequenceRecord
@@ -238,23 +239,19 @@ def call_variants(
         )
         if winner is None:
             continue
-        ref_index, alignment, strand = winner
+        ref_index = winner.reference_record
         _collect_evidence(
-            read,
             quality,
             reference_records[ref_index].sequence,
-            alignment,
-            strand,
+            winner,
             base_quality,
             counts_per_reference[ref_index],
         )
         if call_indels:
             aligned_at, events = _observe_indels(
-                read,
                 quality,
                 reference_records[ref_index],
-                alignment,
-                strand,
+                winner,
                 base_quality,
                 indel_length,
                 sequences,
@@ -301,49 +298,34 @@ def call_variants(
 
 
 def _collect_evidence(
-    read: SequenceRecord,
     quality: tuple[int, ...],
     reference_sequence: str,
-    alignment,
-    strand: str,
+    winner: WinningAlignment,
     min_base_quality: int,
     counts: dict[int, list[int]],
 ) -> None:
-    """Accumulate admitted substitution observations for one read."""
-    read_length = len(read.sequence)
-    aligned_reference = alignment.aligned_reference
-    aligned_query = alignment.aligned_query
-    query_start = alignment.query_start
-    reference_position = alignment.reference_start
-    query_column = 0
+    """Accumulate admitted substitution observations for one read.
 
-    for column in range(len(aligned_reference)):
-        reference_char = aligned_reference[column]
-        # The aligned query is oriented against the reference; on the
-        # reverse strand it is a base of the reverse-complement read, so
-        # it is already expressed on the reference's forward strand.
-        observed = aligned_query[column]
-        consumes_reference = reference_char != "-"
-        consumes_query = observed != "-"
-
-        if consumes_reference and consumes_query:
-            if strand == "+":
-                quality_position = query_start + query_column
-            else:
-                # Only the quality is mapped back to the original read:
-                # the quality string is never reverse complemented.
-                quality_position = read_length - 1 - (query_start + query_column)
-
-            if quality[quality_position] >= min_base_quality:
-                reference_base = reference_sequence[reference_position]
-                if observed in _ACGT_SET and reference_base in _ACGT_SET:
-                    table = counts.setdefault(reference_position, [0, 0, 0, 0])
-                    table[_ACGT.index(observed)] += 1
-
-        if consumes_reference:
-            reference_position += 1
-        if consumes_query:
-            query_column += 1
+    Columns are the single shared interpretation: observed bases are
+    already on the reference forward strand and query coordinates are
+    original-read positions, so the quality string is indexed directly
+    even for a reverse-strand win.
+    """
+    for column in winner.columns():
+        if not column.is_aligned_pair:
+            # Insertions, deletions and unaligned columns never
+            # contribute substitution evidence.
+            continue
+        position = column.reference_position
+        query_index = column.original_query_index
+        assert position is not None and query_index is not None
+        if quality[query_index] < min_base_quality:
+            continue
+        observed = column.observed_base
+        reference_base = reference_sequence[position]
+        if observed in _ACGT_SET and reference_base in _ACGT_SET:
+            table = counts.setdefault(position, [0, 0, 0, 0])
+            table[_ACGT.index(observed)] += 1
 
 
 def _call_position(
@@ -416,11 +398,9 @@ def _event_gaps(pos: int, ref: str, alt: str) -> frozenset[int]:
 
 
 def _observe_indels(
-    read: SequenceRecord,
     quality: tuple[int, ...],
     reference: SequenceRecord,
-    alignment,
-    strand: str,
+    winner: WinningAlignment,
     min_base_quality: int,
     max_indel_length: int,
     sequences: dict[str, str],
@@ -434,79 +414,61 @@ def _observe_indels(
     the event touches and whether this read's supporting evidence meets
     the quality floor.  A read contributes at most one entry per
     normalized event.
+
+    All coordinates, observed bases and gap boundaries come from the
+    shared column interpretation, so an insertion/deletion means exactly
+    one thing here, in coverage and in SNV evidence.
     """
-    read_length = len(read.sequence)
-    aligned_reference = alignment.aligned_reference
-    aligned_query = alignment.aligned_query
-    columns = len(aligned_reference)
+    columns = winner.columns()
 
-    # Per column: the zero-based reference position (None on a reference
-    # gap), the query index on the aligned strand (None on a query gap)
-    # and the next unconsumed zero-based reference position.
-    ref_positions: list[int | None] = []
-    query_indices: list[int | None] = []
-    next_reference: list[int] = []
-    reference_position = alignment.reference_start
-    query_index = alignment.query_start
-    for column in range(columns):
-        next_reference.append(reference_position)
-        reference_char = aligned_reference[column]
-        query_char = aligned_query[column]
-        ref_positions.append(
-            reference_position if reference_char != "-" else None
-        )
-        query_indices.append(query_index if query_char != "-" else None)
-        if reference_char != "-":
-            reference_position += 1
-        if query_char != "-":
-            query_index += 1
-
-    def column_quality(column: int) -> int:
-        index = query_indices[column]
-        assert index is not None
-        if strand == "+":
-            return quality[index]
-        # Map the quality back to the original read coordinates; the
+    def column_quality(column: AlignmentColumn) -> int:
+        # Query indices are already original-read coordinates; the
         # quality string is never reverse complemented.
-        return quality[read_length - 1 - index]
+        index = column.original_query_index
+        assert index is not None
+        return quality[index]
 
     aligned_at: dict[int, int] = {}
-    for column in range(columns):
-        ref_position = ref_positions[column]
-        if ref_position is not None and query_indices[column] is not None:
-            aligned_at[ref_position] = column_quality(column)
+    for column in columns:
+        if column.is_aligned_pair:
+            position = column.reference_position
+            assert position is not None
+            aligned_at[position] = column_quality(column)
 
     events: _IndelEventMap = {}
     reference_sequence = reference.sequence
-    column = 0
-    while column < columns:
-        insertion = aligned_reference[column] == "-"
-        deletion = not insertion and aligned_query[column] == "-"
-        if not insertion and not deletion:
-            column += 1
+    index = 0
+    while index < len(columns):
+        column = columns[index]
+        if not column.is_insertion and not column.is_deletion:
+            index += 1
             continue
+        insertion = column.is_insertion
         # One contiguous I or D CIGAR segment: a maximal run of columns
         # gapped on the same side.
-        start = column
-        while column < columns:
-            reference_gap = aligned_reference[column] == "-"
-            query_gap = aligned_query[column] == "-"
-            if reference_gap != insertion or query_gap != deletion:
-                break
-            column += 1
-        end = column
+        start = index
+        while index < len(columns) and (
+            columns[index].is_insertion if insertion else columns[index].is_deletion
+        ):
+            index += 1
+        end = index
 
         length = end - start
         if length > max_indel_length:
             continue
         # The event needs an aligned read base on both sides.
-        if start == 0 or end == columns:
+        if start == 0 or end == len(columns):
             continue
-        if query_indices[start - 1] is None or query_indices[end] is None:
+        left_column = columns[start - 1]
+        right_column = columns[end]
+        if (
+            left_column.original_query_index is None
+            or right_column.original_query_index is None
+        ):
             continue
         # The gap sits immediately left of the next reference position;
         # the base before it is the left anchor.
-        gap = next_reference[start]
+        gap = columns[start].boundary_position
         anchor = gap - 1
         if anchor < 0:
             continue
@@ -514,7 +476,12 @@ def _observe_indels(
         if anchor_base not in _ACGT_SET:
             continue
         if insertion:
-            inserted = aligned_query[start:end]
+            inserted_parts: list[str] = []
+            for inserted_column in range(start, end):
+                inserted_base = columns[inserted_column].observed_base
+                assert inserted_base is not None
+                inserted_parts.append(inserted_base)
+            inserted = "".join(inserted_parts)
             if any(base not in _ACGT_SET for base in inserted):
                 continue
             ref_allele = anchor_base
@@ -527,12 +494,12 @@ def _observe_indels(
             alt_allele = anchor_base
 
         quality_ok = (
-            column_quality(start - 1) >= min_base_quality
-            and column_quality(end) >= min_base_quality
+            column_quality(left_column) >= min_base_quality
+            and column_quality(right_column) >= min_base_quality
         )
         if quality_ok and insertion:
             quality_ok = all(
-                column_quality(inserted_column) >= min_base_quality
+                column_quality(columns[inserted_column]) >= min_base_quality
                 for inserted_column in range(start, end)
             )
 
