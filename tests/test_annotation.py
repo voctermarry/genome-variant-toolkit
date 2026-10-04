@@ -580,6 +580,134 @@ class TestHeaderAndInfo:
         assert [record.pos for record in result.records] == [4, 7, 10]
 
 
+class TestPercentEncoding:
+    """GFF3 column 9 percent escapes are raw UTF-8, not code points."""
+
+    SEQUENCE = "ATGAAATTTGGGCCC"
+    VCF = HEADER + COLUMNS + "chr1\t2\t.\tT\tC\t.\t.\t.\n"
+    #: UTF-8 of 基因 is E5 9F BA E5 9B A0.
+    GENE = "%E5%9F%BA%E5%9B%A0"
+    #: 基因组 adds E7 BB 84.
+    GENE_LONG = GENE + "%E7%BB%84"
+
+    def test_utf8_escapes_decode_to_text(self) -> None:
+        cds = f"chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx{self.GENE}\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert gvann_of(result) == (
+            "C|START_LOST|HIGH|tx基因|2|ATG>ACG|M>T"
+        )
+
+    def test_literal_non_ascii_passes_through(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx基因\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert gvann_of(result) == (
+            "C|START_LOST|HIGH|tx基因|2|ATG>ACG|M>T"
+        )
+
+    def test_escaped_and_literal_parents_group_together(self) -> None:
+        # Two fragments under one transcript: one names the Parent with
+        # UTF-8 escapes, the other writes it literally.
+        cds = (
+            f"chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=tx{self.GENE}\n"
+            "chr1\tx\tCDS\t10\t15\t.\t+\t0\tParent=tx基因\n"
+        )
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        assert len(items) == 1
+        assert items[0] == "C|START_LOST|HIGH|tx基因|2|ATG>ACG|M>T"
+
+    def test_hex_digits_are_case_insensitive(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%e5%9f%ba%e5%9b%a0\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "tx基因" in gvann_of(result)
+
+    def test_escaped_comma_stays_one_value(self) -> None:
+        # %2C is a literal comma inside one Parent; a real comma still
+        # separates a second value.
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%2Cb,b\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        names = [item.split("|")[3] for item in items]
+        assert names == ["a%2Cb", "b"]
+
+    def test_escapes_split_by_literals_reassemble(self) -> None:
+        # Complete escaped characters scattered around literal text.
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%E5%9F%BAjunk%E5%9B%A0x\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "a基junk因x" in gvann_of(result)
+
+    def test_ascii_escape_and_literals_mix(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=x%41y%42z\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "|xAyBz|" in gvann_of(result)
+
+    def test_transcripts_sorted_by_decoded_parent(self) -> None:
+        cds = (
+            f"chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t{self.GENE_LONG}\n"
+            f"chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t{self.GENE}\n"
+        )
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        items = gvann_of(result).split(",")
+        names = [item.split("|")[3] for item in items]
+        assert names == ["t基因", "t基因组"]
+
+    def test_structural_characters_re_encoded_uppercase(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%2Cb%7Cc%3Bd%3De%25f\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "|a%2Cb%7Cc%3Bd%3De%25f|" in gvann_of(result)
+
+    def test_literal_structural_characters_re_encoded(self) -> None:
+        # A literal pipe is legal inside a GFF3 value (semicolons and
+        # equals are assignment syntax and must already be escaped); the
+        # encoder must still neutralize it for GVANN.
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a|b\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "|a%7Cb|" in gvann_of(result)
+
+    def test_ascii_whitespace_re_encoded(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%09b\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "|a%09b|" in gvann_of(result)
+
+    def test_item_keeps_seven_fields_with_structural_name(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%2Cb\n"
+        result = annotate_text(self.VCF, self.SEQUENCE, cds)
+        item = gvann_of(result)
+        assert len(item.split("|")) == 7
+
+    @pytest.mark.parametrize(
+        "escape",
+        [
+            "tx%",
+            "tx%2",
+            "tx%GG",
+            "tx%E5",
+            "tx%E5%9F",
+            "tx%FF%FF",
+            "tx%C0%80",
+            "tx%E5junk%9F%BA%E5%9B%A0",
+            "tx%E5%9F%BA%E5%9Bjunk%A0",
+        ],
+    )
+    def test_malformed_escapes_raise(self, escape: str) -> None:
+        cds = f"chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent={escape}\n"
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            annotate_text(self.VCF, self.SEQUENCE, cds)
+        message = str(excinfo.value)
+        assert "<stream>:1:" in message
+        assert "Parent" in message
+
+    def test_malformed_escape_keeps_source_line_number(self) -> None:
+        cds = (
+            "##gff-version 3\n"
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=tx%E5\n"
+        )
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            annotate_text(self.VCF, self.SEQUENCE, cds)
+        assert "<stream>:3:" in str(excinfo.value)
+
+
 class TestGffValidation:
     SEQUENCE = "ATGAAATTTGGGCCC"
 

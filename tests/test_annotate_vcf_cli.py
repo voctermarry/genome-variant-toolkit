@@ -447,6 +447,112 @@ class TestAnnotateVcfCli:
             "GVANN=<DEL>|UNSUPPORTED|MODIFIER|.|.|.|."
         )
 
+    def test_malformed_gff_escape_exit_2(self, tmp_path, reference_file) -> None:
+        bad_features = tmp_path / "bad.gff3"
+        # %E5 alone cannot start a valid multi-byte UTF-8 sequence.
+        bad_features.write_text(
+            "chr1\ttest\tCDS\t1\t9\t.\t+\t0\tParent=tx%E5\n"
+        )
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(bad_features),
+            ],
+            HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n",
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+        assert str(bad_features) in err and ":1:" in err
+
+    def test_malformed_escape_preserves_existing_output(
+        self, tmp_path, reference_file
+    ) -> None:
+        bad_features = tmp_path / "bad.gff3"
+        bad_features.write_text(
+            "chr1\ttest\tCDS\t1\t9\t.\t+\t0\tParent=tx%ZZ\n"
+        )
+        target = tmp_path / "out.vcf"
+        target.write_text("PREVIOUS\n")
+        vcf_path = tmp_path / "in.vcf"
+        vcf_path.write_text(
+            HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n"
+        )
+        code, out, err = run(
+            [
+                "annotate-vcf", str(vcf_path),
+                "--reference", str(reference_file),
+                "--features", str(bad_features),
+                "--output", str(target),
+            ]
+        )
+        assert code == 2
+        assert out == ""
+        assert target.read_text() == "PREVIOUS\n"
+        leftovers = [
+            path.name
+            for path in tmp_path.iterdir()
+            if path.name.startswith(".annotate-vcf-")
+        ]
+        assert leftovers == []
+
+    def test_utf8_escaped_parent_roundtrip_to_file(
+        self, tmp_path, reference_file
+    ) -> None:
+        # 基因 encoded as UTF-8 percent escapes on one fragment and
+        # written literally on the other: one transcript.
+        features = tmp_path / "features.gff3"
+        features.write_text(
+            "chr1\ttest\tCDS\t1\t9\t.\t+\t0\tParent=tx%E5%9F%BA%E5%9B%A0\n"
+            "chr1\ttest\tCDS\t10\t15\t.\t+\t0\tParent=tx基因\n"
+        )
+        vcf_path = tmp_path / "in.vcf"
+        vcf_path.write_text(
+            HEADER + COLUMNS + "chr1\t2\t.\tT\tC\t.\t.\t.\n"
+        )
+        out_path = tmp_path / "out.vcf"
+        code, out, err = run(
+            [
+                "annotate-vcf", str(vcf_path),
+                "--reference", str(reference_file),
+                "--features", str(features),
+                "--output", str(out_path),
+            ]
+        )
+        assert code == 0
+        assert out == "" and err == ""
+        assert out_path.read_text().endswith(
+            "GVANN=C|START_LOST|HIGH|tx基因|2|ATG>ACG|M>T\n"
+        )
+
+    def test_escaped_comma_stays_one_transcript(
+        self, tmp_path, reference_file
+    ) -> None:
+        features = tmp_path / "features.gff3"
+        features.write_text(
+            "chr1\ttest\tCDS\t1\t15\t.\t+\t0\tParent=a%2Cb\n"
+        )
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features),
+            ],
+            HEADER + COLUMNS + "chr1\t2\t.\tT\tC\t.\t.\t.\n",
+        )
+        assert code == 0
+        assert err == ""
+        assert "GVANN=C|START_LOST|HIGH|a%2Cb|2|ATG>ACG|M>T" in out
+        # The GVANN item still has exactly seven pipe-separated fields.
+        gvann = [
+            line.split("\t", 8)[7]
+            for line in out.splitlines()
+            if line.startswith("chr1")
+        ][0]
+        item = gvann[len("GVANN="):]
+        assert len(item.split("|")) == 7
+
     def test_normalized_inframe_deletion_annotated(
         self, reference_file, features_file
     ) -> None:

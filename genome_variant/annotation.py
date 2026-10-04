@@ -10,7 +10,17 @@ Public API:
   every record of a :class:`~genome_variant.vcf.VcfFile`.
 
 CDS features are grouped by their GFF3 ``Parent`` attribute into
-transcripts.  The standard genetic code is used.  Single-base ``A``/``C``/
+transcripts.  Attribute values follow the GFF3 percent-encoding rules:
+multi-values are split on literal commas first, then ``%HH`` escapes are
+interpreted as raw UTF-8 bytes (hex case-insensitive), so ``Parent``
+values spelled with UTF-8 escapes and the same values written literally
+are one transcript.  Malformed escapes or escaped bytes that do not form
+valid UTF-8 are GFF3 format errors.  When transcript names are written
+into ``GVANN``, characters that would break VCF INFO/GVANN structure
+are re-encoded as upper-case ``%HH`` UTF-8 bytes while other non-ASCII
+characters pass through literally.
+
+The standard genetic code is used.  Single-base ``A``/``C``/
 ``G``/``T`` substitutions inside a CDS are classified by their codon
 change.  Ordinary ``A``/``C``/``G``/``T`` insertions and deletions are
 graded by their length change: a non-multiple of three is ``FRAMESHIFT``
@@ -140,25 +150,74 @@ def _gff_error(source: str, line_number: int, message: str) -> AnnotationFormatE
     return AnnotationFormatError(f"{source}:{line_number}: {message}")
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
 def _decode_gff3(text: str) -> str:
-    """Decode one percent-encoded GFF3 attribute value component."""
+    """Decode one percent-encoded GFF3 attribute value component.
+
+    Percent escapes encode raw UTF-8 bytes, not Unicode code points:
+    each run of ``%HH`` sequences is collected and decoded as one UTF-8
+    sequence, so escapes may spell the bytes of a multi-byte character
+    consecutively or be separated into runs.  Hex digits are
+    case-insensitive and literal characters, including non-ASCII text
+    already present in the UTF-8 input, pass through unchanged.
+    """
     output: list[str] = []
+    escaped_bytes = bytearray()
+
+    def flush_escaped() -> None:
+        if not escaped_bytes:
+            return
+        try:
+            output.append(bytes(escaped_bytes).decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"percent escapes do not form valid UTF-8: {exc}"
+            ) from None
+        escaped_bytes.clear()
+
     index = 0
-    while index < len(text):
+    length = len(text)
+    while index < length:
         char = text[index]
         if char == "%":
-            if index + 2 >= len(text):
+            if index + 2 >= length:
                 raise ValueError("truncated percent escape")
-            try:
-                output.append(chr(int(text[index + 1 : index + 3], 16)))
-            except ValueError:
+            high, low = text[index + 1], text[index + 2]
+            if high not in _HEX_DIGITS or low not in _HEX_DIGITS:
                 raise ValueError(
                     f"invalid percent escape {text[index:index + 3]!r}"
                 )
+            escaped_bytes.append(int(high + low, 16))
             index += 3
         else:
+            # A literal character ends the current run of escaped bytes:
+            # a multi-byte UTF-8 sequence cannot straddle a literal byte,
+            # so an unfinished run is malformed input.
+            flush_escaped()
             output.append(char)
             index += 1
+    flush_escaped()
+    return "".join(output)
+
+
+def _encode_gff3(text: str) -> str:
+    """Re-encode a decoded GFF3 value for safe use inside a GVANN field.
+
+    Characters that delimit VCF INFO or GVANN structure (``%``, ``,``,
+    ``;``, ``|``, ``=``), together with ASCII whitespace and ASCII
+    control characters, are percent-encoded by their UTF-8 bytes using
+    upper-case hex.  Every other character, including non-ASCII text,
+    is written literally.
+    """
+    output: list[str] = []
+    for char in text:
+        code = ord(char)
+        if char in "%,;|=" or code < 0x20 or code == 0x20 or code == 0x7F:
+            output.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        else:
+            output.append(char)
     return "".join(output)
 
 
@@ -648,7 +707,8 @@ def _annotate_indel(
             continue
         consequence, impact, cds_pos = result
         items.append(
-            f"{alt}|{consequence}|{impact}|{transcript.parent}|{cds_pos}|.|."
+            f"{alt}|{consequence}|{impact}|{_encode_gff3(transcript.parent)}"
+            f"|{cds_pos}|.|."
         )
 
     if not items:
@@ -703,7 +763,7 @@ def _annotate_alt(
         if any(base not in "ACGT" for base in old_bases):
             # Ambiguous coding context: the standard code cannot judge it.
             items.append(
-                f"{alt}|UNSUPPORTED|MODIFIER|{transcript.parent}|"
+                f"{alt}|UNSUPPORTED|MODIFIER|{_encode_gff3(transcript.parent)}|"
                 f"{site.cds_pos}|.|."
             )
             continue
@@ -725,7 +785,7 @@ def _annotate_alt(
                     alt,
                     consequence,
                     impact,
-                    transcript.parent,
+                    _encode_gff3(transcript.parent),
                     str(site.cds_pos),
                     f"{old_codon}>{new_codon}",
                     f"{old_aa}>{new_aa}",
@@ -791,7 +851,13 @@ def annotate_vcf(
     was missing).  Coding consequences are ``START_LOST``,
     ``STOP_GAINED``, ``STOP_LOST``, ``SYNONYMOUS`` and ``MISSENSE`` with
     impacts ``HIGH``, ``HIGH``, ``HIGH``, ``LOW`` and ``MODERATE``;
-    transcripts are listed by lexicographic Parent.  Pure ``ACGT``
+    transcripts are listed by lexicographic Parent.  GFF3 attribute
+    percent escapes are decoded as UTF-8 bytes (comma-separated values
+    are split on literal commas before decoding, so an escaped comma
+    stays inside one value); the ``TRANSCRIPT`` field re-encodes
+    ``%``, ``,``, ``;``, ``|``, ``=`` and ASCII whitespace or control
+    characters as upper-case ``%HH`` UTF-8 bytes and writes other
+    non-ASCII characters literally.  Pure ``ACGT``
     insertions and deletions are graded per transcript after trimming the
     longest common prefix and suffix of REF and ALT: a length change not
     divisible by three is ``FRAMESHIFT``/``HIGH`` and an in-frame change
