@@ -673,6 +673,117 @@ class TestGffValidation:
         assert ":1:" in message and "past the end" in message
 
 
+class TestPercentDecoding:
+    """GFF3 attribute values: %HH escapes are UTF-8 bytes."""
+
+    SEQUENCE = "ATGAAATTTGGGCCC"
+
+    def annotate(self, gff_text: str, vcf_text: str | None = None) -> VcfFile:
+        if vcf_text is None:
+            vcf_text = HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n"
+        return annotate_text(vcf_text, self.SEQUENCE, gff_text)
+
+    def test_utf8_escape_decodes_to_characters(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%E5%9F%BA%E5%9B%A0\n"
+        result = self.annotate(cds)
+        assert gvann_of(result) == "T|STOP_GAINED|HIGH|tx基因|4|AAA>TAA|K>*"
+
+    def test_lowercase_hex_is_equivalent(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%e5%9f%ba%e5%9b%a0\n"
+        result = self.annotate(cds)
+        assert gvann_of(result) == "T|STOP_GAINED|HIGH|tx基因|4|AAA>TAA|K>*"
+
+    def test_escaped_and_plain_forms_group_into_one_transcript(self) -> None:
+        # The second fragment's CDS_POS only makes sense if both rows
+        # assembled into a single 15-base transcript.
+        cds = (
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=tx%E5%9F%BA%E5%9B%A0\n"
+            "chr1\tx\tCDS\t10\t15\t.\t+\t0\tParent=tx基因\n"
+        )
+        text = HEADER + COLUMNS + "chr1\t12\t.\tG\tA\t.\t.\t.\n"
+        result = self.annotate(cds, text)
+        assert gvann_of(result) == "A|SYNONYMOUS|LOW|tx基因|12|GGG>GGA|G>G"
+
+    def test_escaped_comma_is_one_parent(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%2C1\n"
+        result = self.annotate(cds)
+        # One transcript; the decoded comma is re-encoded in GVANN.
+        assert gvann_of(result) == "T|STOP_GAINED|HIGH|tx%2C1|4|AAA>TAA|K>*"
+
+    def test_multi_value_parent_still_splits_on_plain_comma(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=txB,tx%41\n"
+        result = self.annotate(cds)
+        # Two transcripts, ordered by the decoded Parent (txA < txB).
+        assert gvann_of(result) == (
+            "T|STOP_GAINED|HIGH|txA|4|AAA>TAA|K>*,"
+            "T|STOP_GAINED|HIGH|txB|4|AAA>TAA|K>*"
+        )
+
+    def test_transcripts_sorted_by_decoded_parent(self) -> None:
+        cds = (
+            "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=txB\n"
+            "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%41\n"
+        )
+        result = self.annotate(cds)
+        assert gvann_of(result) == (
+            "T|STOP_GAINED|HIGH|txA|4|AAA>TAA|K>*,"
+            "T|STOP_GAINED|HIGH|txB|4|AAA>TAA|K>*"
+        )
+
+    def test_structural_characters_reencoded_in_transcript(self) -> None:
+        # Decoded "a=b;c|d e%" would break the GVANN/VCF structure.
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=a%3Db%3Bc%7Cd%20e%25\n"
+        result = self.annotate(cds)
+        assert gvann_of(result) == (
+            "T|STOP_GAINED|HIGH|a%3Db%3Bc%7Cd%20e%25|4|AAA>TAA|K>*"
+        )
+
+    def test_non_ascii_transcript_emitted_directly(self) -> None:
+        cds = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx基因\n"
+        result = self.annotate(cds)
+        assert gvann_of(result) == "T|STOP_GAINED|HIGH|tx基因|4|AAA>TAA|K>*"
+
+    def test_truncated_escape_rejected(self) -> None:
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%4\n")
+        assert "<stream>:1:" in str(excinfo.value)
+
+    def test_lone_percent_rejected(self) -> None:
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%\n")
+        assert "<stream>:1:" in str(excinfo.value)
+
+    def test_non_hex_escape_rejected(self) -> None:
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%GG\n")
+        assert "<stream>:1:" in str(excinfo.value)
+
+    def test_non_hex_sign_escape_rejected(self) -> None:
+        # "%+1" is not a hexadecimal escape even though int() parses it.
+        with pytest.raises(AnnotationFormatError):
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%+1\n")
+
+    def test_invalid_utf8_escape_bytes_rejected(self) -> None:
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%FF\n")
+        assert "<stream>:1:" in str(excinfo.value)
+
+    def test_incomplete_utf8_sequence_rejected(self) -> None:
+        # E5 9F starts a three-byte sequence that never completes.
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate("chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=tx%E5%9F\n")
+        assert "<stream>:1:" in str(excinfo.value)
+
+    def test_error_reports_source_line(self) -> None:
+        cds = (
+            "chr1\tx\tCDS\t1\t9\t.\t+\t0\tParent=t1\n"
+            "chr1\tx\tCDS\t10\t15\t.\t+\t0\tParent=t%FF\n"
+        )
+        with pytest.raises(AnnotationFormatError) as excinfo:
+            self.annotate(cds)
+        assert "<stream>:2:" in str(excinfo.value)
+
+
 class TestReferenceErrors:
     CDS = "chr1\tx\tCDS\t1\t15\t.\t+\t0\tParent=t1\n"
 

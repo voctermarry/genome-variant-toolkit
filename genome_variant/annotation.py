@@ -10,7 +10,15 @@ Public API:
   every record of a :class:`~genome_variant.vcf.VcfFile`.
 
 CDS features are grouped by their GFF3 ``Parent`` attribute into
-transcripts.  The standard genetic code is used.  Single-base ``A``/``C``/
+transcripts.  Attribute values are split on unescaped commas and each
+value's ``%HH`` escapes are then restored as UTF-8 bytes (unescaped
+non-ASCII text is kept as-is), so ``Parent=tx%E5%9F%BA%E5%9B%A0`` and
+``Parent=tx基因`` name the same transcript.  In the ``GVANN`` TRANSCRIPT
+field, characters that would break the VCF INFO or GVANN structure
+(``%``, ``,``, ``;``, ``|``, ``=`` and ASCII whitespace or control
+characters) are percent-encoded by UTF-8 byte with upper-case hex;
+other non-ASCII characters are emitted directly.  The standard genetic
+code is used.  Single-base ``A``/``C``/
 ``G``/``T`` substitutions inside a CDS are classified by their codon
 change.  Ordinary ``A``/``C``/``G``/``T`` insertions and deletions are
 graded by their length change: a non-multiple of three is ``FRAMESHIFT``
@@ -140,25 +148,64 @@ def _gff_error(source: str, line_number: int, message: str) -> AnnotationFormatE
     return AnnotationFormatError(f"{source}:{line_number}: {message}")
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
 def _decode_gff3(text: str) -> str:
-    """Decode one percent-encoded GFF3 attribute value component."""
-    output: list[str] = []
+    """Decode one percent-encoded GFF3 attribute value component.
+
+    Escapes are UTF-8 bytes, not Unicode code points: the ``%HH``
+    sequences (consecutive or scattered) contribute their bytes and the
+    unescaped text — already decoded UTF-8 — contributes its own
+    encoding, then the assembled bytes are decoded as UTF-8.  Hex digits
+    are case-insensitive.  Truncated escapes, non-hex escapes and escape
+    bytes that do not form valid UTF-8 raise :class:`ValueError`.
+    """
+    buffer = bytearray()
     index = 0
     while index < len(text):
         char = text[index]
         if char == "%":
             if index + 2 >= len(text):
                 raise ValueError("truncated percent escape")
-            try:
-                output.append(chr(int(text[index + 1 : index + 3], 16)))
-            except ValueError:
+            digits = text[index + 1 : index + 3]
+            if any(digit not in _HEX_DIGITS for digit in digits):
                 raise ValueError(
                     f"invalid percent escape {text[index:index + 3]!r}"
                 )
+            buffer.append(int(digits, 16))
             index += 3
         else:
-            output.append(char)
+            buffer.extend(char.encode("utf-8"))
             index += 1
+    try:
+        return bytes(buffer).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(
+            "percent escapes do not form valid UTF-8"
+        ) from None
+
+
+#: Characters that would break the VCF INFO column or the GVANN
+#: ``|``/``,``/``=`` structure, and therefore cannot appear literally in
+#: a TRANSCRIPT field.
+_GVANN_ESCAPED = frozenset("%,;|=")
+
+
+def _encode_transcript(name: str) -> str:
+    """Render a transcript name safe for the GVANN TRANSCRIPT field.
+
+    ``%``, ``,``, ``;``, ``|``, ``=`` and ASCII whitespace or control
+    characters are percent-encoded by UTF-8 byte with upper-case hex;
+    every other character, including non-ASCII ones, is emitted as-is.
+    """
+    output: list[str] = []
+    for char in name:
+        code = ord(char)
+        if char in _GVANN_ESCAPED or code <= 0x20 or code == 0x7F:
+            output.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        else:
+            output.append(char)
     return "".join(output)
 
 
@@ -648,7 +695,8 @@ def _annotate_indel(
             continue
         consequence, impact, cds_pos = result
         items.append(
-            f"{alt}|{consequence}|{impact}|{transcript.parent}|{cds_pos}|.|."
+            f"{alt}|{consequence}|{impact}|"
+            f"{_encode_transcript(transcript.parent)}|{cds_pos}|.|."
         )
 
     if not items:
@@ -703,7 +751,8 @@ def _annotate_alt(
         if any(base not in "ACGT" for base in old_bases):
             # Ambiguous coding context: the standard code cannot judge it.
             items.append(
-                f"{alt}|UNSUPPORTED|MODIFIER|{transcript.parent}|"
+                f"{alt}|UNSUPPORTED|MODIFIER|"
+                f"{_encode_transcript(transcript.parent)}|"
                 f"{site.cds_pos}|.|."
             )
             continue
@@ -725,7 +774,7 @@ def _annotate_alt(
                     alt,
                     consequence,
                     impact,
-                    transcript.parent,
+                    _encode_transcript(transcript.parent),
                     str(site.cds_pos),
                     f"{old_codon}>{new_codon}",
                     f"{old_aa}>{new_aa}",
@@ -782,7 +831,8 @@ def annotate_vcf(
     *reference* is a mapping of CHROM to upper-case sequence or an
     iterable of :class:`~genome_variant.sequence_io.SequenceRecord`;
     *features* is a GFF3 text path or text stream whose CDS features
-    define the annotated ranges, grouped into transcripts by ``Parent``.
+    define the annotated ranges, grouped into transcripts by ``Parent``
+    after percent-decoding attribute values as UTF-8 bytes.
 
     Record order, ALT order, sample columns and every existing field are
     preserved; one unique ``##INFO`` declaration for ``GVANN`` is

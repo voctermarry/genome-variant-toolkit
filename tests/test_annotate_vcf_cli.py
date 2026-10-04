@@ -490,3 +490,63 @@ class TestAnnotateVcfCli:
         assert out_path.read_text().endswith(
             "GVANN=AT|FRAMESHIFT|HIGH|t1|7|.|.\n"
         )
+
+    def test_utf8_percent_encoded_parent(self, tmp_path, reference_file) -> None:
+        features = tmp_path / "features.gff3"
+        features.write_text(
+            "chr1\ttest\tCDS\t1\t15\t.\t+\t0\tParent=tx%E5%9F%BA%E5%9B%A0\n"
+        )
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(features),
+            ],
+            HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n",
+        )
+        assert code == 0
+        assert err == ""
+        assert out.endswith(
+            "GVANN=T|STOP_GAINED|HIGH|tx基因|4|AAA>TAA|K>*\n"
+        )
+
+    def test_bad_percent_escape_exit_2_empty_stdout(
+        self, tmp_path, reference_file
+    ) -> None:
+        bad_features = tmp_path / "bad.gff3"
+        bad_features.write_text("chr1\ttest\tCDS\t1\t15\t.\t+\t0\tParent=t%FF\n")
+        code, out, err = run(
+            [
+                "annotate-vcf", "-",
+                "--reference", str(reference_file),
+                "--features", str(bad_features),
+            ],
+            HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n",
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+        assert str(bad_features) in err and ":1:" in err
+
+    def test_bad_percent_escape_preserves_existing_output(
+        self, tmp_path, reference_file
+    ) -> None:
+        bad_features = tmp_path / "bad.gff3"
+        bad_features.write_text("chr1\ttest\tCDS\t1\t15\t.\t+\t0\tParent=t%2\n")
+        target = tmp_path / "out.vcf"
+        target.write_text("PREVIOUS\n")
+        vcf_path = tmp_path / "in.vcf"
+        vcf_path.write_text(
+            HEADER + COLUMNS + "chr1\t4\t.\tA\tT\t.\t.\t.\n"
+        )
+        code, out, err = run(
+            [
+                "annotate-vcf", str(vcf_path),
+                "--reference", str(reference_file),
+                "--features", str(bad_features),
+                "--output", str(target),
+            ]
+        )
+        assert code == 2
+        assert out == ""
+        assert target.read_text() == "PREVIOUS\n"
