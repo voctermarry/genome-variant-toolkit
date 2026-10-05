@@ -24,6 +24,7 @@ import math
 from collections.abc import Iterable
 
 from ._columns import alignment_columns, original_read_position
+from .alignment import _score_parameter
 from .mapping import _best_candidate
 from .quality import ReadQualityError
 from .sequence_io import SequenceRecord
@@ -112,13 +113,21 @@ def call_variants(
     sample_name: str = "SAMPLE",
     call_indels: bool = False,
     max_indel_length: int = 50,
+    match_score: int = 2,
+    mismatch_penalty: int = 3,
+    gap_open: int = 5,
+    gap_extend: int = 2,
+    min_score: int = 1,
 ) -> VcfFile:
     """Call single-sample SNVs and return them as a :class:`~genome_variant.vcf.VcfFile`.
 
-    Each read is mapped exactly as in :func:`~genome_variant.mapping.map_reads`
-    (same local-alignment scoring, both strands, same candidate
-    adjudication); unmapped reads contribute nothing.  Every mapped read
-    contributes at most one observation per covered reference position.
+    Each read is mapped exactly as in
+    :func:`~genome_variant.mapping.map_reads` with the given
+    *match_score*, *mismatch_penalty*, *gap_open*, *gap_extend* and
+    *min_score* (same local-alignment scoring, both strands, same
+    candidate adjudication); unmapped reads contribute nothing.  Every
+    mapped read contributes at most one observation per covered reference
+    position.
     A base is admitted as evidence only when its Phred quality is at least
     *min_base_quality* and both the reference base and the observed base
     are among ``A``, ``C``, ``G`` and ``T``; on the reverse strand the
@@ -159,8 +168,13 @@ def call_variants(
     *min_alt_fraction* and *homozygous_fraction* finite numbers in 0-1
     (defaults 0.2 and 0.8), with the homozygous fraction no smaller than
     the minimum ALT fraction; *max_indel_length* a non-boolean positive
-    integer (default 50).  Invalid thresholds raise :class:`ValueError`
-    before either input is consumed.  Reads must carry quality values; a
+    integer (default 50).  The mapping parameters *match_score*,
+    *mismatch_penalty*, *gap_open*, *gap_extend* and *min_score* have the
+    same meaning, defaults and constraints as for
+    :func:`~genome_variant.mapping.map_reads` and select the winning
+    candidate of every read.  Invalid thresholds or mapping parameters
+    raise :class:`ValueError` before either input is consumed.  Reads
+    must carry quality values; a
     read without them or with a quality/sequence length mismatch raises
     :class:`~genome_variant.quality.ReadQualityError` when that read is
     reached.  An empty reference collection, duplicate reference
@@ -185,6 +199,22 @@ def call_variants(
         )
     indel_length = _positive_threshold("max_indel_length", max_indel_length)
 
+    match = _score_parameter("match_score", match_score, positive=True)
+    mismatch = _score_parameter(
+        "mismatch_penalty", mismatch_penalty, positive=False
+    )
+    open_penalty = _score_parameter("gap_open", gap_open, positive=False)
+    extend_penalty = _score_parameter(
+        "gap_extend", gap_extend, positive=False
+    )
+    if not isinstance(min_score, int) or isinstance(min_score, bool):
+        kind = type(min_score).__name__
+        raise ValueError(
+            f"min_score must be a non-boolean integer, not {kind}"
+        )
+    if min_score < 1:
+        raise ValueError("min_score must be a positive integer")
+
     sample = _validate_sample_name(sample_name)
 
     reference_records = list(references)
@@ -197,11 +227,6 @@ def call_variants(
                 f"duplicate reference identifier {reference.identifier!r}"
             )
         seen.add(reference.identifier)
-
-    # Mapping uses the same local-alignment scoring and candidate
-    # adjudication as map-reads; callers cannot tune them here.
-    match, mismatch = 2, 3
-    open_penalty, extend_penalty, min_score = 5, 2, 1
 
     # One counter table per reference record: position -> [A, C, G, T].
     counts_per_reference: list[dict[int, list[int]]] = [

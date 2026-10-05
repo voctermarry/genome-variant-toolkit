@@ -31,6 +31,7 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from .alignment import _score_parameter
 from .calling import VariantCallingError, call_variants
 from .sequence_io import SequenceRecord, read_sequences
 from .summary import SampleCall, VariantSummary
@@ -169,6 +170,11 @@ def batch_call_variants(
     homozygous_fraction: float = 0.8,
     call_indels: bool = False,
     max_indel_length: int = 50,
+    match_score: int = 2,
+    mismatch_penalty: int = 3,
+    gap_open: int = 5,
+    gap_extend: int = 2,
+    min_score: int = 1,
 ) -> tuple[VariantSummary, ...]:
     """Call variants for every manifest sample and merge the results.
 
@@ -181,21 +187,25 @@ def batch_call_variants(
 
     Each entry's FASTQ reads are called independently with
     :func:`~genome_variant.calling.call_variants` (same quality
-    thresholds, allele counting, allele fractions, genotyping and
-    optional short-indel semantics), using the entry's ``sample`` as the
-    sample name.  The per-sample results are normalized against the
-    reference and merged by ``CHROM``, ``POS``, ``REF`` and ``ALT``
-    exactly as in :func:`~genome_variant.summary.summarize_variants`;
-    no intermediate VCF is produced.
+    thresholds, allele counting, allele fractions, genotyping, optional
+    short-indel semantics and mapping scoring parameters), using the
+    entry's ``sample`` as the sample name.  Every sample is called with
+    the same mapping settings.  The per-sample results are normalized
+    against the reference and merged by ``CHROM``, ``POS``, ``REF`` and
+    ``ALT`` exactly as in
+    :func:`~genome_variant.summary.summarize_variants`; no intermediate
+    VCF is produced.
 
     Returns :class:`~genome_variant.summary.VariantSummary` objects
     ordered by reference record order, then POS, REF and ALT; each
     summary's ``samples`` follow manifest order.  A run without variants
     returns an empty tuple.
 
-    The threshold arguments and their constraints are those of
-    :func:`~genome_variant.calling.call_variants`; invalid thresholds
-    raise :class:`ValueError` before any sample's reads are consumed.
+    The threshold and mapping-scoring arguments and their constraints are
+    those of :func:`~genome_variant.calling.call_variants`; invalid
+    mapping parameters raise :class:`ValueError` before the manifest, the
+    reference or any reads are consumed, and invalid thresholds raise
+    :class:`ValueError` before any sample's reads are consumed.
     An empty reference collection or duplicate reference identifiers
     raise :class:`VariantCallingError`.  Manifest problems raise
     :class:`BatchManifestError`; malformed reads raise
@@ -205,6 +215,21 @@ def batch_call_variants(
     :class:`~genome_variant.quality.ReadQualityError`, as in single-sample
     calling.  File access failures propagate as :class:`OSError`.
     """
+    # Validate the mapping parameters before the manifest, the reference
+    # or any sample's reads are consumed; the remaining thresholds are
+    # checked by the zero-read call below.
+    _score_parameter("match_score", match_score, positive=True)
+    _score_parameter("mismatch_penalty", mismatch_penalty, positive=False)
+    _score_parameter("gap_open", gap_open, positive=False)
+    _score_parameter("gap_extend", gap_extend, positive=False)
+    if not isinstance(min_score, int) or isinstance(min_score, bool):
+        kind = type(min_score).__name__
+        raise ValueError(
+            f"min_score must be a non-boolean integer, not {kind}"
+        )
+    if min_score < 1:
+        raise ValueError("min_score must be a positive integer")
+
     if isinstance(manifest, (str, os.PathLike, io.IOBase)):
         entries = read_batch_manifest(manifest)
     else:
@@ -227,6 +252,11 @@ def batch_call_variants(
         homozygous_fraction=homozygous_fraction,
         call_indels=call_indels,
         max_indel_length=max_indel_length,
+        match_score=match_score,
+        mismatch_penalty=mismatch_penalty,
+        gap_open=gap_open,
+        gap_extend=gap_extend,
+        min_score=min_score,
     )
 
     # Reference order for sorting; identifiers are unique at this point.
@@ -251,6 +281,11 @@ def batch_call_variants(
             sample_name=entry.sample,
             call_indels=call_indels,
             max_indel_length=max_indel_length,
+            match_score=match_score,
+            mismatch_penalty=mismatch_penalty,
+            gap_open=gap_open,
+            gap_extend=gap_extend,
+            min_score=min_score,
         )
         normalized = normalize_vcf(document, reference_records)
         for record in normalized.records:

@@ -435,6 +435,45 @@ def _build_parser() -> argparse.ArgumentParser:
         "quality values are a calling error",
     )
     call_variants_cmd.add_argument(
+        "--match",
+        "--match-score",
+        dest="match",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="match score, a positive integer (default: 2)",
+    )
+    call_variants_cmd.add_argument(
+        "--mismatch",
+        "--mismatch-penalty",
+        dest="mismatch",
+        type=_nonnegative_int,
+        default=3,
+        metavar="N",
+        help="mismatch penalty, a non-negative integer (default: 3)",
+    )
+    call_variants_cmd.add_argument(
+        "--gap-open",
+        type=_nonnegative_int,
+        default=5,
+        metavar="N",
+        help="gap opening penalty, a non-negative integer (default: 5)",
+    )
+    call_variants_cmd.add_argument(
+        "--gap-extend",
+        type=_nonnegative_int,
+        default=2,
+        metavar="N",
+        help="gap extension penalty, a non-negative integer (default: 2)",
+    )
+    call_variants_cmd.add_argument(
+        "--min-score",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="minimum local-alignment score to consider mapped (default: 1)",
+    )
+    call_variants_cmd.add_argument(
         "--min-base-quality",
         type=_quality_int,
         default=20,
@@ -501,6 +540,45 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reference",
         required=True,
         help="reference FASTA file (required); '-' denotes standard input",
+    )
+    batch_call_cmd.add_argument(
+        "--match",
+        "--match-score",
+        dest="match",
+        type=_positive_int,
+        default=2,
+        metavar="N",
+        help="match score, a positive integer (default: 2)",
+    )
+    batch_call_cmd.add_argument(
+        "--mismatch",
+        "--mismatch-penalty",
+        dest="mismatch",
+        type=_nonnegative_int,
+        default=3,
+        metavar="N",
+        help="mismatch penalty, a non-negative integer (default: 3)",
+    )
+    batch_call_cmd.add_argument(
+        "--gap-open",
+        type=_nonnegative_int,
+        default=5,
+        metavar="N",
+        help="gap opening penalty, a non-negative integer (default: 5)",
+    )
+    batch_call_cmd.add_argument(
+        "--gap-extend",
+        type=_nonnegative_int,
+        default=2,
+        metavar="N",
+        help="gap extension penalty, a non-negative integer (default: 2)",
+    )
+    batch_call_cmd.add_argument(
+        "--min-score",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="minimum local-alignment score to consider mapped (default: 1)",
     )
     batch_call_cmd.add_argument(
         "--min-base-quality",
@@ -1319,6 +1397,11 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
                 max_indel_length=(
                     50 if args.max_indel_length is None else args.max_indel_length
                 ),
+                match_score=args.match,
+                mismatch_penalty=args.mismatch,
+                gap_open=args.gap_open,
+                gap_extend=args.gap_extend,
+                min_score=args.min_score,
             )
             text = render_vcf(document)
         except (
@@ -1389,6 +1472,11 @@ def _run_batch_call_variants(
             max_indel_length=(
                 50 if args.max_indel_length is None else args.max_indel_length
             ),
+            match_score=args.match,
+            mismatch_penalty=args.mismatch,
+            gap_open=args.gap_open,
+            gap_extend=args.gap_extend,
+            min_score=args.min_score,
         )
     except (
         BatchManifestError,
