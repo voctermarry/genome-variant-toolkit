@@ -152,6 +152,8 @@ genome-variant-toolkit call-variants REFERENCE READS \
     [--min-alt-fraction F] [--homozygous-fraction F] \
     [--sample-name NAME] \
     [--call-indels] [--max-indel-length N] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
     [--output OUTPUT]
 ```
 
@@ -162,6 +164,7 @@ genome-variant-toolkit call-variants REFERENCE READS \
 - `--min-base-quality`（默认 20，0 至 93 的非布尔整数）：只接纳 Phred 不低于该值的碱基；`DP` 为通过门槛的 `ACGT` 观测总数。
 - `--min-alt-count`（默认 2，正整数）与 `--min-alt-fraction`（默认 0.2，0 至 1 的有限数）：非参考碱基中计数最高者为唯一 ALT，并列时按 `A`、`C`、`G`、`T` 选择；ALT 计数达到门槛且 `AC/DP` 不低于最小比例才输出。
 - `--homozygous-fraction`（默认 0.8，0 至 1 的有限数，且不得低于 `--min-alt-fraction`）：ALT 比例不低于该值时 GT 为 `1/1`，否则为 `0/1`。
+- `--match`（别名 `--match-score`，默认 2）、`--mismatch`（别名 `--mismatch-penalty`，默认 3）、`--gap-open`（默认 5）、`--gap-extend`（默认 2）与 `--min-score`（默认 1）：映射阶段的局部比对计分与最低分门槛，名称、默认值、取值约束与含义同 `map-reads`；每条读段按本次给定参数完成正反链局部比对、最低分过滤与既有同分裁决，胜出结果再进入碱基质量过滤与证据统计。
 - 输出记录按参考输入次序、再按 `POS`、`REF`、`ALT` 升序排列（同一位置的多个合格 indel 分别成行）；`REF`、`ALT` 大写，`ID` 为 `.`，`QUAL` 为点，`FILTER` 为 `PASS`；`INFO` 为 `DP`、`AC`、`AF`（`AF` 固定六位小数），`FORMAT` 为 `GT:DP:AD`，`AD` 为参考与所选 ALT 的计数，样本名默认 `SAMPLE`（`--sample-name` 覆盖，不得为空、纯空白或含制表符）。
 - 无候选时仍输出完整头部（7 行 `##` 元信息加 `#CHROM` 列头）。写文件时仅在全部读取与调用成功后经同目录临时文件原子替换，失败保留原目标；读段分批不影响逐字节结果。
 - 返回码：成功 `0`；参数错误、非法阈值（在消费输入前报错）、空参考、重复参考标识、非法样本名、缺少质量或质量长度错误、FASTQ 与序列错误均为 `2`（标准错误单行、标准输出为空）；文件读写错误 `1`。
@@ -176,11 +179,13 @@ genome-variant-toolkit batch-call-variants MANIFEST \
     [--min-base-quality N] [--min-alt-count N] \
     [--min-alt-fraction F] [--homozygous-fraction F] \
     [--call-indels] [--max-indel-length N] \
+    [--match N] [--mismatch N] [--gap-open N] [--gap-extend N] \
+    [--min-score N] \
     [--output OUTPUT]
 ```
 
 - 清单为 JSON Lines：每个非空行是仅含字符串字段 `sample` 与 `reads` 的 JSON 对象；`sample` 不得为空、纯空白或含制表符，且在清单内唯一；`reads` 为 FASTQ 路径且不得为 `-`。文件清单中的相对 `reads` 按清单所在目录解析，流清单（`MANIFEST` 为 `-`）按当前工作目录解析。
-- 每个清单项按原顺序读取读段，以 `sample` 为样本名，按 `call-variants` 的质量门槛、等位计数、等位比例、基因型及可选短插入缺失语义独立调用；各阈值选项与 `--call-indels`、`--max-indel-length` 的默认值、约束和结果与逐样本调用一致。
+- 每个清单项按原顺序读取读段，以 `sample` 为样本名，按 `call-variants` 的质量门槛、等位计数、等位比例、基因型及可选短插入缺失语义独立调用；各阈值选项与 `--call-indels`、`--max-indel-length` 的默认值、约束和结果与逐样本调用一致。`--match`、`--mismatch`、`--gap-open`、`--gap-extend`、`--min-score` 与 `call-variants` 同名选项含义、默认值和约束相同，同一组映射设置作用于清单中的所有样本。
 - 各样本结果按 `summarize-variants` 的参考规范化规则合并，输出与其相同的紧凑 JSON Lines：字段、统计口径与排序一致，`samples` 保持清单顺序，没有变异时输出为空。相同参考、清单、读段与参数跨运行产生逐字节相同的结果。
 - `MANIFEST`、`--reference` 与 `--output` 沿用标准流约定，但清单与参考不能同时来自标准输入。
 - 输出到文件时仅在全部样本调用与汇总成功后经同目录临时文件原子替换；失败保留已有目标且不留临时结果。
@@ -313,7 +318,7 @@ genome-variant-toolkit compare-variants BASELINE CANDIDATE --reference REFERENCE
 模块 `genome_variant.calling` 提供：
 
 - `VariantCallingError`（`ValueError` 子类）：参考集合为空、参考标识重复或样本名为空、纯空白、含制表符（或非字符串）时抛出。
-- `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE", call_indels=False, max_indel_length=50)`：返回可由 `read_vcf` 读回的 `VcfFile`（VCFv4.2，单样本）。映射与 `map_reads` 使用相同的局部比对计分（固定默认值）、正反链搜索与候选裁决；质量不参与映射，只过滤碱基证据。仅统计参考碱基与观测碱基都属于 `ACGT` 的比对列，插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；每条已映射读段在同一参考位置至多贡献一次观测，负链观测碱基按参考正链报告而质量取自原读段对应位置。`DP` 为通过质量门槛的 `ACGT` 观测总数，唯一 ALT 为非参考碱基中计数最高者（并列按 `A`、`C`、`G`、`T`），ALT 计数至少 `min_alt_count` 且 `AC/DP` 至少 `min_alt_fraction` 才输出记录；比例不低于 `homozygous_fraction` 时 GT 为 `1/1`，否则 `0/1`。`call_indels` 为真时额外从胜出比对的连续 `I`、`D` CIGAR 片段调用短插入/短缺失：插入以左侧参考碱基加插入序列、缺失以左锚点加被删除参考片段表示；无左锚点、缺少任一侧已对齐读段碱基、相关参考或插入碱基非 `ACGT`、或长度超过 `max_indel_length` 的事件忽略；插入证据要求两侧及全部插入碱基质量达标，缺失证据要求两侧碱基质量达标。候选经参考感知的最简化与左对齐后按 `CHROM`、`POS`、`REF`、`ALT` 合并；事件 `DP` 为同时跨过左右边界、两侧质量达标且未在该边界产生其他插入或缺失的已映射读段数，`AC` 为其中支持该事件的读段数，`AD` 为 `DP-AC,AC`。记录按参考输入次序、`POS`、`REF`、`ALT` 排列，`INFO` 为 `DP`、`AC`、`AF`（六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 限于 0 至 93 的非布尔整数，`min_alt_count` 与 `max_indel_length` 为非布尔正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例；非法阈值在消费任一输入前抛出 `ValueError`，样本名与参考错误抛出 `VariantCallingError`，读段缺少质量、质量长度错误或质量越界在迭代到该读段时抛出 `ReadQualityError`。
+- `call_variants(references, reads, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, sample_name="SAMPLE", call_indels=False, max_indel_length=50, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：返回可由 `read_vcf` 读回的 `VcfFile`（VCFv4.2，单样本）。映射与 `map_reads` 使用相同的局部比对计分、正反链搜索与候选裁决（计分参数语义、默认值与约束同 `map_reads`）；质量不参与映射，只过滤碱基证据。仅统计参考碱基与观测碱基都属于 `ACGT` 的比对列，插入、缺失、未对齐部分、未映射读段与歧义碱基忽略；每条已映射读段在同一参考位置至多贡献一次观测，负链观测碱基按参考正链报告而质量取自原读段对应位置。`DP` 为通过质量门槛的 `ACGT` 观测总数，唯一 ALT 为非参考碱基中计数最高者（并列按 `A`、`C`、`G`、`T`），ALT 计数至少 `min_alt_count` 且 `AC/DP` 至少 `min_alt_fraction` 才输出记录；比例不低于 `homozygous_fraction` 时 GT 为 `1/1`，否则 `0/1`。`call_indels` 为真时额外从胜出比对的连续 `I`、`D` CIGAR 片段调用短插入/短缺失：插入以左侧参考碱基加插入序列、缺失以左锚点加被删除参考片段表示；无左锚点、缺少任一侧已对齐读段碱基、相关参考或插入碱基非 `ACGT`、或长度超过 `max_indel_length` 的事件忽略；插入证据要求两侧及全部插入碱基质量达标，缺失证据要求两侧碱基质量达标。候选经参考感知的最简化与左对齐后按 `CHROM`、`POS`、`REF`、`ALT` 合并；事件 `DP` 为同时跨过左右边界、两侧质量达标且未在该边界产生其他插入或缺失的已映射读段数，`AC` 为其中支持该事件的读段数，`AD` 为 `DP-AC,AC`。记录按参考输入次序、`POS`、`REF`、`ALT` 排列，`INFO` 为 `DP`、`AC`、`AF`（六位小数），`FORMAT` 为 `GT:DP:AD`。`min_base_quality` 限于 0 至 93 的非布尔整数，`min_alt_count` 与 `max_indel_length` 为非布尔正整数，两个比例为 0 至 1 的有限数且纯合比例不得低于最小 ALT 比例；`match_score` 与 `min_score` 为非布尔正整数，`mismatch_penalty`、`gap_open`、`gap_extend` 为非布尔非负整数；非法阈值或映射参数在消费任一输入前抛出 `ValueError`，样本名与参考错误抛出 `VariantCallingError`，读段缺少质量、质量长度错误或质量越界在迭代到该读段时抛出 `ReadQualityError`。
 
 模块 `genome_variant.coverage` 提供：
 
@@ -356,7 +361,7 @@ genome-variant-toolkit compare-variants BASELINE CANDIDATE --reference REFERENCE
 - `BatchManifestError`（`ValueError` 子类）：清单非合法 JSON、行不是对象、字段缺失/多余/类型非法、`sample` 为空、纯空白或含制表符、样本名重复，或 `reads` 为空、非字符串或为 `-` 时抛出；消息含清单来源与一基行号。
 - `BatchManifestEntry(line_number, sample, reads)`：一条清单项，含一基清单行号、唯一样本名与已解析的 FASTQ 路径。
 - `read_batch_manifest(source)`：接受清单文本路径或文本流，忽略空行，返回按清单次序的 `BatchManifestEntry` 元组；文件清单的相对 `reads` 按其目录解析，流清单按当前工作目录解析。
-- `batch_call_variants(manifest, reference, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, call_indels=False, max_indel_length=50)`：`manifest` 为清单路径/流或 `BatchManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。按清单顺序对每个样本的 FASTQ 读段以 `call_variants` 语义独立调用（阈值参数与约束相同），样本名取清单 `sample`；各样本结果按 `summarize_variants` 的参考规范化规则合并，不产生中间 VCF。返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序；无变异时返回空元组。非法阈值在消费任何读段前抛 `ValueError`，空参考或重复参考标识抛 `VariantCallingError`，清单问题抛 `BatchManifestError`，读段格式、碱基与质量问题抛对应现有异常，文件访问失败抛 `OSError`。
+- `batch_call_variants(manifest, reference, *, min_base_quality=20, min_alt_count=2, min_alt_fraction=0.2, homozygous_fraction=0.8, call_indels=False, max_indel_length=50, match_score=2, mismatch_penalty=3, gap_open=5, gap_extend=2, min_score=1)`：`manifest` 为清单路径/流或 `BatchManifestEntry` 序列，`reference` 为 FASTA 路径/流或 `SequenceRecord` 可迭代对象。按清单顺序对每个样本的 FASTQ 读段以 `call_variants` 语义独立调用（阈值与映射参数及约束相同，同一组映射设置作用于所有样本），样本名取清单 `sample`；各样本结果按 `summarize_variants` 的参考规范化规则合并，不产生中间 VCF。返回按参考次序、`POS`、`REF`、`ALT` 排序的 `VariantSummary` 元组，每项的 `samples` 保持清单次序；无变异时返回空元组。非法阈值在消费任何读段前抛 `ValueError`，空参考或重复参考标识抛 `VariantCallingError`，清单问题抛 `BatchManifestError`，读段格式、碱基与质量问题抛对应现有异常，文件访问失败抛 `OSError`。
 
 序列只允许 IUPAC DNA 符号 `ACGTRYSWKMBDHVN`（小写输入会转大写）；FASTQ 质量字符范围为 ASCII 33–126，质量长度必须等于序列长度。
 

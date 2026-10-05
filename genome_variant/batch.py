@@ -31,6 +31,7 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from .alignment import _score_parameter
 from .calling import VariantCallingError, call_variants
 from .sequence_io import SequenceRecord, read_sequences
 from .summary import SampleCall, VariantSummary
@@ -169,6 +170,11 @@ def batch_call_variants(
     homozygous_fraction: float = 0.8,
     call_indels: bool = False,
     max_indel_length: int = 50,
+    match_score: int = 2,
+    mismatch_penalty: int = 3,
+    gap_open: int = 5,
+    gap_extend: int = 2,
+    min_score: int = 1,
 ) -> tuple[VariantSummary, ...]:
     """Call variants for every manifest sample and merge the results.
 
@@ -194,8 +200,11 @@ def batch_call_variants(
     returns an empty tuple.
 
     The threshold arguments and their constraints are those of
-    :func:`~genome_variant.calling.call_variants`; invalid thresholds
-    raise :class:`ValueError` before any sample's reads are consumed.
+    :func:`~genome_variant.calling.call_variants`, including the mapping
+    arguments *match_score*, *mismatch_penalty*, *gap_open*, *gap_extend*
+    and *min_score*; the same mapping settings apply to every manifest
+    sample.  Invalid thresholds raise :class:`ValueError` before any
+    sample's reads are consumed.
     An empty reference collection or duplicate reference identifiers
     raise :class:`VariantCallingError`.  Manifest problems raise
     :class:`BatchManifestError`; malformed reads raise
@@ -209,6 +218,21 @@ def batch_call_variants(
         entries = read_batch_manifest(manifest)
     else:
         entries = tuple(manifest)
+
+    # Validate the mapping parameters before the reference or any
+    # sample's reads are consumed; call_variants re-validates them (and
+    # the remaining thresholds) on the zero-read check below.
+    _score_parameter("match_score", match_score, positive=True)
+    _score_parameter("mismatch_penalty", mismatch_penalty, positive=False)
+    _score_parameter("gap_open", gap_open, positive=False)
+    _score_parameter("gap_extend", gap_extend, positive=False)
+    if not isinstance(min_score, int) or isinstance(min_score, bool):
+        kind = type(min_score).__name__
+        raise ValueError(
+            f"min_score must be a non-boolean integer, not {kind}"
+        )
+    if min_score < 1:
+        raise ValueError("min_score must be a positive integer")
 
     if isinstance(reference, (str, os.PathLike, io.IOBase)):
         reference_records = tuple(read_sequences(reference, format="fasta"))
@@ -227,6 +251,11 @@ def batch_call_variants(
         homozygous_fraction=homozygous_fraction,
         call_indels=call_indels,
         max_indel_length=max_indel_length,
+        match_score=match_score,
+        mismatch_penalty=mismatch_penalty,
+        gap_open=gap_open,
+        gap_extend=gap_extend,
+        min_score=min_score,
     )
 
     # Reference order for sorting; identifiers are unique at this point.
@@ -251,6 +280,11 @@ def batch_call_variants(
             sample_name=entry.sample,
             call_indels=call_indels,
             max_indel_length=max_indel_length,
+            match_score=match_score,
+            mismatch_penalty=mismatch_penalty,
+            gap_open=gap_open,
+            gap_extend=gap_extend,
+            min_score=min_score,
         )
         normalized = normalize_vcf(document, reference_records)
         for record in normalized.records:
