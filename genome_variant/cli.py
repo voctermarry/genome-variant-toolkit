@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -739,49 +740,30 @@ def _run_normalize(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             output_format = "fastq" if first.quality is not None else "fasta"
             records = _prefix(first, records)
 
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            output_stream = sys.stdout
-            close_output = False
-        else:
-            try:
-                output_stream = open(args.output, "w", encoding="utf-8", newline="")
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            close_output = True
-
+        # Serialize the complete result into memory before the output is
+        # touched: every record is read and validated here, so a failure
+        # leaves an existing target in place and creates no temp file.
+        buffer = io.StringIO(newline="")
         try:
-            try:
-                write_sequences(
-                    records,
-                    output_stream,
-                    format=output_format,
-                    line_width=args.line_width,
-                )
-            except (SequenceFormatError, SequenceValidationError, ValueError) as exc:
-                # ValueError covers usage problems such as writing FASTA
-                # records without quality values as FASTQ.
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 2
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if close_output:
-                try:
-                    output_stream.close()
-                except OSError as exc:
-                    print(f"{parser.prog}: {exc}", file=sys.stderr)
-                    return 1
+            write_sequences(
+                records,
+                buffer,
+                format=output_format,
+                line_width=args.line_width,
+            )
+        except (SequenceFormatError, SequenceValidationError, ValueError) as exc:
+            # ValueError covers usage problems such as writing FASTA
+            # records without quality values as FASTQ.
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
     finally:
         if close_input:
             input_stream.close()
 
-    return 0
+    return _commit_output(args.output, buffer.getvalue(), parser)
 
 
 def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -807,59 +789,22 @@ def _run_filter_reads(args: argparse.Namespace, parser: argparse.ArgumentParser)
             min_length=args.min_length,
         )
 
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            output_stream = sys.stdout
-            close_output = False
-            temporary_path = None
-        else:
-            output_stream, temporary_path = _open_temporary_output(
-                args.output, parser
-            )
-            if output_stream is None:
-                return 1
-            close_output = True
-
+        # Materialize the full filtered result first, so a malformed or
+        # invalid later record fails before the output is touched.
+        buffer = io.StringIO(newline="")
         try:
-            try:
-                write_sequences(filtered, output_stream, format="fastq")
-            except _READ_ERRORS as exc:
-                if temporary_path is not None:
-                    _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 2
-            except OSError as exc:
-                if temporary_path is not None:
-                    _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-
-            if temporary_path is not None:
-                try:
-                    output_stream.flush()
-                    output_stream.close()
-                    os.replace(temporary_path, args.output)
-                except OSError as exc:
-                    _discard_temporary(output_stream, temporary_path)
-                    print(f"{parser.prog}: {exc}", file=sys.stderr)
-                    return 1
-        finally:
-            # On failure the temporary file was already closed and removed
-            # by _discard_temporary; on success it was closed explicitly
-            # before os.replace. This only closes a still-open temp stream.
-            if close_output and not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
+            write_sequences(filtered, buffer, format="fastq")
+        except _READ_ERRORS as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 1
     finally:
         if close_input:
             input_stream.close()
 
-    return 0
+    return _commit_output(args.output, buffer.getvalue(), parser)
 
 
 def _run_deduplicate_reads(
@@ -895,73 +840,26 @@ def _run_deduplicate_reads(
         output_format = "fastq" if first.quality is not None else "fasta"
         records = _prefix(first, records)
 
-        # Deduplicate (validating every record) before any output is
-        # produced, so a failure never creates partial output or touches
-        # an existing output file.
+        # Deduplicate (validating every record) and serialize the result
+        # before any output is produced, so a failure never creates
+        # partial output or touches an existing output file.
         try:
             unique_records = deduplicate_reads(
                 records, canonical=args.canonical
             )
+            buffer = io.StringIO(newline="")
+            write_sequences(unique_records, buffer, format=output_format)
         except _READ_ERRORS as exc:
             print(f"{parser.prog}: {exc}", file=sys.stderr)
             return 2
         except OSError as exc:
             print(f"{parser.prog}: {exc}", file=sys.stderr)
             return 1
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            output_stream = sys.stdout
-            close_output = False
-            temporary_path = None
-        else:
-            output_stream, temporary_path = _open_temporary_output(
-                args.output, parser, prefix=".deduplicate-reads-"
-            )
-            if output_stream is None:
-                return 1
-            close_output = True
-
-        try:
-            try:
-                write_sequences(unique_records, output_stream, format=output_format)
-            except _READ_ERRORS as exc:
-                if temporary_path is not None:
-                    _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 2
-            except OSError as exc:
-                if temporary_path is not None:
-                    _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-
-            if temporary_path is not None:
-                try:
-                    output_stream.flush()
-                    output_stream.close()
-                    os.replace(temporary_path, args.output)
-                except OSError as exc:
-                    _discard_temporary(output_stream, temporary_path)
-                    print(f"{parser.prog}: {exc}", file=sys.stderr)
-                    return 1
-        finally:
-            # On failure the temporary file was already closed and removed
-            # by _discard_temporary; on success it was closed explicitly
-            # before os.replace. This only closes a still-open stream.
-            if close_output and not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_input:
             input_stream.close()
 
-    return 0
+    return _commit_output(args.output, buffer.getvalue(), parser)
 
 
 def _run_kmer_index(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1016,46 +914,11 @@ def _run_kmer_index(args: argparse.Namespace, parser: argparse.ArgumentParser) -
                 )
             )
         text = "".join(line + "\n" for line in lines)
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".kmer-index-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_input:
             input_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _read_single_record(
@@ -1161,48 +1024,13 @@ def _run_align_pair(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             print(f"{parser.prog}: {exc}", file=sys.stderr)
             return 2
         text = _alignment_to_json(result) + "\n"
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".align-pair-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_ref:
             ref_stream.close()
         if close_query:
             query_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _open_input(path: str, parser: argparse.ArgumentParser) -> tuple[object, bool, int]:
@@ -1267,48 +1095,13 @@ def _run_normalize_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser
             return 2
 
         text = render_vcf(normalized)
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".normalize-vcf-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_vcf:
             vcf_stream.close()
         if close_ref:
             ref_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _run_annotate_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1381,41 +1174,6 @@ def _run_annotate_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser)
             return 1
 
         text = render_vcf(annotated)
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".annotate-vcf-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_vcf:
             vcf_stream.close()
@@ -1424,7 +1182,7 @@ def _run_annotate_vcf(args: argparse.Namespace, parser: argparse.ArgumentParser)
         if close_feat:
             feat_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _mapping_to_json(mapping) -> str:
@@ -1490,48 +1248,13 @@ def _run_map_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             return 2
 
         text = "".join(line + "\n" for line in lines)
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".map-reads-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_ref:
             ref_stream.close()
         if close_reads:
             read_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1609,48 +1332,13 @@ def _run_call_variants(args: argparse.Namespace, parser: argparse.ArgumentParser
         except OSError as exc:
             print(f"{parser.prog}: {exc}", file=sys.stderr)
             return 1
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".call-variants-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_ref:
             ref_stream.close()
         if close_reads:
             read_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _run_batch_call_variants(
@@ -1716,44 +1404,7 @@ def _run_batch_call_variants(
         print(f"{parser.prog}: {exc}", file=sys.stderr)
         return 1
 
-    text = render_summaries(summaries)
-
-    if args.output == "-":
-        # Keep output byte-stable across platforms: no newline
-        # translation on standard output.
-        if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(newline="")
-        try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-        except OSError as exc:
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-        return 0
-
-    output_stream, temporary_path = _open_temporary_output(
-        args.output, parser, prefix=".batch-call-variants-"
-    )
-    if output_stream is None:
-        return 1
-    try:
-        try:
-            output_stream.write(text)
-            output_stream.flush()
-            output_stream.close()
-            os.replace(temporary_path, args.output)
-        except OSError as exc:
-            _discard_temporary(output_stream, temporary_path)
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-    finally:
-        if not output_stream.closed:
-            try:
-                output_stream.close()
-            except OSError:
-                pass
-
-    return 0
+    return _commit_output(args.output, render_summaries(summaries), parser)
 
 
 def _run_coverage_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1818,48 +1469,13 @@ def _run_coverage_report(args: argparse.Namespace, parser: argparse.ArgumentPars
             return 2
 
         text = "".join(line + "\n" for line in lines)
-
-        if args.output == "-":
-            # Keep output byte-stable across platforms: no newline
-            # translation on standard output.
-            if hasattr(sys.stdout, "reconfigure"):
-                sys.stdout.reconfigure(newline="")
-            try:
-                sys.stdout.write(text)
-                sys.stdout.flush()
-            except OSError as exc:
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-            return 0
-
-        output_stream, temporary_path = _open_temporary_output(
-            args.output, parser, prefix=".coverage-report-"
-        )
-        if output_stream is None:
-            return 1
-        try:
-            try:
-                output_stream.write(text)
-                output_stream.flush()
-                output_stream.close()
-                os.replace(temporary_path, args.output)
-            except OSError as exc:
-                _discard_temporary(output_stream, temporary_path)
-                print(f"{parser.prog}: {exc}", file=sys.stderr)
-                return 1
-        finally:
-            if not output_stream.closed:
-                try:
-                    output_stream.close()
-                except OSError:
-                    pass
     finally:
         if close_ref:
             ref_stream.close()
         if close_reads:
             read_stream.close()
 
-    return 0
+    return _commit_output(args.output, text, parser)
 
 
 def _run_summarize_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1896,44 +1512,7 @@ def _run_summarize_variants(args: argparse.Namespace, parser: argparse.ArgumentP
         print(f"{parser.prog}: {exc}", file=sys.stderr)
         return 1
 
-    text = render_summaries(summaries)
-
-    if args.output == "-":
-        # Keep output byte-stable across platforms: no newline
-        # translation on standard output.
-        if hasattr(sys.stdout, "reconfigure"):
-            sys.stdout.reconfigure(newline="")
-        try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-        except OSError as exc:
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-        return 0
-
-    output_stream, temporary_path = _open_temporary_output(
-        args.output, parser, prefix=".summarize-variants-"
-    )
-    if output_stream is None:
-        return 1
-    try:
-        try:
-            output_stream.write(text)
-            output_stream.flush()
-            output_stream.close()
-            os.replace(temporary_path, args.output)
-        except OSError as exc:
-            _discard_temporary(output_stream, temporary_path)
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-    finally:
-        if not output_stream.closed:
-            try:
-                output_stream.close()
-            except OSError:
-                pass
-
-    return 0
+    return _commit_output(args.output, render_summaries(summaries), parser)
 
 
 def _run_compare_variants(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1979,11 +1558,29 @@ def _run_compare_variants(args: argparse.Namespace, parser: argparse.ArgumentPar
         print(f"{parser.prog}: {exc}", file=sys.stderr)
         return 1
 
-    text = render_comparison(comparison)
+    return _commit_output(args.output, render_comparison(comparison), parser)
 
-    if args.output == "-":
-        # Keep output byte-stable across platforms: no newline
-        # translation on standard output.
+
+def _commit_output(
+    destination: str,
+    text: str,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Publish one fully computed result through the shared output rule.
+
+    ``"-"`` writes *text* verbatim to standard output (with newline
+    translation disabled so bytes are stable across platforms); a plain
+    path goes through a single atomic transaction: the complete UTF-8
+    content is written, flushed and closed in a sibling temporary file
+    and only then replaces the target once.  Any :class:`OSError` along
+    the way prints one line on standard error and returns ``1``; the
+    target is never touched and no temporary file is left behind.
+    Cleanup errors can neither replace that return code nor append more
+    error lines.
+    """
+    if destination == "-":
+        # Standard output never uses a temporary file.  Disable newline
+        # translation so successful runs are byte-stable across platforms.
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(newline="")
         try:
@@ -1994,62 +1591,14 @@ def _run_compare_variants(args: argparse.Namespace, parser: argparse.ArgumentPar
             return 1
         return 0
 
-    output_stream, temporary_path = _open_temporary_output(
-        args.output, parser, prefix=".compare-variants-"
-    )
-    if output_stream is None:
-        return 1
-    try:
-        try:
-            output_stream.write(text)
-            output_stream.flush()
-            output_stream.close()
-            os.replace(temporary_path, args.output)
-        except OSError as exc:
-            _discard_temporary(output_stream, temporary_path)
-            print(f"{parser.prog}: {exc}", file=sys.stderr)
-            return 1
-    finally:
-        if not output_stream.closed:
-            try:
-                output_stream.close()
-            except OSError:
-                pass
-
-    return 0
-
-
-def _discard_temporary(stream: object, path: str) -> None:
-    """Close and remove a temporary output file after a failed run."""
-    close = getattr(stream, "close", None)
-    if callable(close):
-        try:
-            close()
-        except OSError:
-            pass
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
-
-
-def _open_temporary_output(
-    destination: str,
-    parser: argparse.ArgumentParser,
-    prefix: str = ".filter-reads-",
-) -> tuple[object, str] | tuple[None, None]:
-    """Create a temporary text file next to *destination*.
-
-    Returns ``(stream, path)``; on failure prints one error line and
-    returns ``(None, None)``.
-    """
     output_dir = os.path.dirname(os.path.abspath(destination))
+    fd: int | None = None
+    temporary_path: str | None = None
+    stream = None
     try:
-        fd, path = tempfile.mkstemp(
+        fd, temporary_path = tempfile.mkstemp(
             dir=output_dir,
-            prefix=prefix,
+            prefix=".genome-variant-toolkit-",
             suffix=".tmp",
         )
         # mkstemp creates files with mode 0600; match the mode a plain
@@ -2057,21 +1606,50 @@ def _open_temporary_output(
         current_umask = os.umask(0)
         os.umask(current_umask)
         os.fchmod(fd, 0o666 & ~current_umask)
-    except OSError as exc:
-        print(f"{parser.prog}: {exc}", file=sys.stderr)
-        return None, None
-    try:
-        return os.fdopen(fd, "w", encoding="utf-8", newline=""), path
-    except OSError as exc:
+
         try:
-            os.close(fd)
-        finally:
+            stream = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        except OSError:
+            # fdopen takes ownership of fd only on success.
             try:
-                os.unlink(path)
+                os.close(fd)
+            finally:
+                fd = None
+            raise
+
+        # All content must be written, flushed and closed successfully
+        # before os.replace publishes it.
+        stream.write(text)
+        stream.flush()
+        stream.close()
+        stream = None
+        fd = None
+
+        # The only point at which an existing target can change.
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    except OSError as exc:
+        # Clean up without masking the original failure: secondary errors
+        # are swallowed so the first message and exit code survive.
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        elif fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
             except OSError:
                 pass
         print(f"{parser.prog}: {exc}", file=sys.stderr)
-        return None, None
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
